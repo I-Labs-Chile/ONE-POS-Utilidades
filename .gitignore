@@ -1,0 +1,19 @@
+# Ignorar carpetas y archivos innecesarios
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Entornos virtuales
+.venv/
+venv/
+
+# Archivos de caché de pytest
+.pytest_cache/
+
+# Archivos de configuración de IDE
+.vscode/
+.idea/
+
+# Archivos temporales del sistema
+.DS_Store
+Thumbs.db
