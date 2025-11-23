@@ -1,0 +1,39 @@
+# IPP Print Server Requirements
+# Core dependencies for a universal thermal printer IPP server
+
+# Web server and HTTP handling
+aiohttp>=3.8.0,<4.0.0
+
+# mDNS/DNS-SD service discovery  
+zeroconf>=0.47.0,<1.0.0
+
+# USB printer communication
+pyusb>=1.2.0,<2.0.0
+
+# Image processing and document conversion
+Pillow>=9.0.0,<11.0.0
+
+# Optional: Better PDF handling via Python (alternative to ghostscript)
+pypdf>=3.0.0,<4.0.0
+
+# Optional: Better performance monitoring
+psutil>=5.8.0,<6.0.0
+
+# Development and packaging
+pyinstaller>=5.0.0,<6.0.0
+
+# Testing (optional)
+pytest>=7.0.0,<8.0.0
+pytest-asyncio>=0.21.0,<1.0.0
+
+# Note: Ghostscript binary is also recommended for PDF conversion
+# Install separately:
+#   Ubuntu/Debian: sudo apt-get install ghostscript
+#   Windows: Download from https://www.ghostscript.com/download/gsdnld.html  
+#   macOS: brew install ghostscript
+
+# IPP protocol library (optional, for enhanced IPP support)
+# ipypp>=0.1.0  # Uncomment if available
+
+# For enhanced ESC/POS command generation (optional)
+# python-escpos>=3.0a0  # Uncomment if needed
