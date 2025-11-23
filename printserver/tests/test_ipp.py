@@ -1,15 +1,9 @@
-"""
-Tests for IPP server functionality
-
-This module tests the IPP server implementation including
-protocol parsing, server responses, and integration with backends.
-"""
-
 import pytest
 import asyncio
 import io
 import json
 from unittest.mock import Mock, AsyncMock, patch
+import logging
 
 # Add parent directory to path for imports
 import sys
@@ -23,11 +17,12 @@ from server.ipp_parser import (
 from server.ipp_server import IPPServer
 from config.settings import settings
 
+logger = logging.getLogger(__name__)
+
 class TestIPPParser:
-    """Test IPP protocol parsing and serialization"""
     
     def test_parse_simple_request(self):
-        """Test parsing a simple IPP request"""
+
         # Create a minimal IPP request
         request_data = self._create_minimal_ipp_request(
             operation=IPPOperation.GET_PRINTER_ATTRIBUTES,
@@ -48,7 +43,7 @@ class TestIPPParser:
         assert 'attributes-natural-language' in message.operation_attributes
     
     def test_build_response(self):
-        """Test building IPP response"""
+
         attributes = {
             'printer-name': 'Test Printer',
             'printer-state': 3,  # idle
@@ -71,7 +66,7 @@ class TestIPPParser:
         assert response_data[1] == 1  # Version minor
     
     def test_parse_print_job_request(self):
-        """Test parsing a Print-Job request with document data"""
+
         # Create Print-Job request with document
         document_data = b"Test document content"
         request_data = self._create_print_job_request(document_data)
@@ -83,7 +78,6 @@ class TestIPPParser:
         assert 'document-format' in message.operation_attributes
     
     def test_attribute_serialization(self):
-        """Test various attribute types serialization"""
         test_cases = [
             ('string-attr', IPPTag.TEXT_WITHOUT_LANGUAGE, 'Test String'),
             ('integer-attr', IPPTag.INTEGER, 42),
@@ -105,7 +99,6 @@ class TestIPPParser:
             assert len(response) > 0
     
     def _create_minimal_ipp_request(self, operation: int, request_id: int) -> bytes:
-        """Create a minimal valid IPP request"""
         stream = io.BytesIO()
         
         # IPP header
@@ -127,7 +120,6 @@ class TestIPPParser:
         return stream.getvalue()
     
     def _create_print_job_request(self, document_data: bytes) -> bytes:
-        """Create a Print-Job IPP request with document"""
         stream = io.BytesIO()
         
         # IPP header
@@ -154,26 +146,31 @@ class TestIPPParser:
         return stream.getvalue()
     
     def _write_attribute(self, stream: io.BytesIO, name: str, tag: IPPTag, value: str):
-        """Helper to write an attribute to stream"""
+        if not name or not isinstance(name, str):
+            raise ValueError("Attribute name must be a non-empty string")
+        if not value or not isinstance(value, str):
+            raise ValueError("Attribute value must be a non-empty string")
+
         # Write tag
         stream.write(bytes([tag]))
-        
+
         # Write name
         name_bytes = name.encode('utf-8')
         stream.write(len(name_bytes).to_bytes(2, 'big'))
         stream.write(name_bytes)
-        
+
         # Write value
         value_bytes = value.encode('utf-8')
         stream.write(len(value_bytes).to_bytes(2, 'big'))
         stream.write(value_bytes)
 
+        logger.debug(f"Writing attribute: name={name}, tag={tag}, value={value}")
+
 @pytest.mark.asyncio
 class TestIPPServer:
-    """Test IPP server functionality"""
     
     async def test_server_initialization(self):
-        """Test server can be initialized"""
+
         mock_backend = Mock()
         mock_converter = Mock()
         
@@ -184,7 +181,7 @@ class TestIPPServer:
         assert not server.is_running
     
     async def test_get_printer_attributes_response(self):
-        """Test Get-Printer-Attributes operation"""
+
         mock_backend = Mock()
         mock_converter = Mock()
         
@@ -203,10 +200,9 @@ class TestIPPServer:
         assert len(response_data) > 8
         
         # Parse response to verify structure
-        # (In a real test, you'd parse and verify specific attributes)
     
     async def test_print_job_validation(self):
-        """Test Print-Job request validation"""
+
         mock_backend = AsyncMock()
         mock_converter = AsyncMock()
         mock_converter.convert_to_escpos = AsyncMock(return_value=b"ESC/POS commands")
@@ -227,11 +223,14 @@ class TestIPPServer:
         # Should return successful response
         assert isinstance(response_data, bytes)
         
+        # Wait for the asynchronous task to complete
+        await asyncio.sleep(0.1)  # Adjust time as needed to ensure task completion
+        
         # Converter should have been called
         mock_converter.convert_to_escpos.assert_called_once()
     
     async def test_validate_job_operation(self):
-        """Test Validate-Job operation"""
+
         mock_backend = Mock()
         mock_converter = Mock()
         
@@ -251,7 +250,7 @@ class TestIPPServer:
         assert len(response_data) > 0
     
     async def test_unsupported_document_format(self):
-        """Test handling of unsupported document format"""
+
         mock_backend = Mock()
         mock_converter = Mock()
         
@@ -271,7 +270,7 @@ class TestIPPServer:
         # In a full test, you'd parse the response and verify error status
     
     async def test_job_management(self):
-        """Test job creation and management"""
+
         server = IPPServer(Mock(), Mock())
         
         # Create a job
@@ -292,17 +291,16 @@ class TestIPPServer:
         assert job['state'] == 3  # pending
 
 class TestServerConfiguration:
-    """Test server configuration and settings"""
     
     def test_default_settings(self):
-        """Test default configuration values"""
+
         assert settings.SERVER_PORT == 631  # Standard IPP port
         assert 'application/pdf' in settings.SUPPORTED_FORMATS
         assert 'Print-Job' in settings.SUPPORTED_OPERATIONS
         assert settings.IPP_VERSION == "2.1"
     
     def test_printer_attributes(self):
-        """Test printer attributes configuration"""
+
         attrs = settings.PRINTER_ATTRIBUTES
         
         # Required attributes
@@ -317,7 +315,6 @@ class TestServerConfiguration:
         assert 'thermal' in attrs.get('printer-kind', [])
     
     def test_mdns_txt_records(self):
-        """Test mDNS TXT record configuration"""
         txt = settings.MDNS_TXT_RECORDS
         
         # Required for AirPrint
@@ -331,7 +328,6 @@ class TestServerConfiguration:
         assert txt['Duplex'] == 'F'  # No duplex
     
     def test_configuration_validation(self):
-        """Test configuration validation"""
         from server.utils import validate_configuration
         
         # Should pass with default config

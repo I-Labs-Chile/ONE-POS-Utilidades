@@ -16,6 +16,7 @@ Options:
     --config PATH       Configuration file path
     --no-mdns           Disable mDNS service announcement
     --debug             Enable debug mode
+    --print-logs        Enable printing logs to thermal printer
     --help              Show this help message
 
 Environment Variables:
@@ -23,6 +24,7 @@ Environment Variables:
     PRINTSERVER_PORT    Server port
     PRINTER_NAME        Printer name for mDNS
     LOG_LEVEL          Logging level
+    PRINT_LOGS_TO_PRINTER  Enable log printing to printer
 """
 
 import asyncio
@@ -46,11 +48,14 @@ import server.printer_backend as printer_backend_module
 import server.converter as converter_module
 import server.mdns_announcer as mdns_module
 import server.utils as utils_module
+import server.log_printer as log_printer_module
 
 IPPServer = ipp_server_module.IPPServer
 create_printer_backend = printer_backend_module.create_printer_backend
 DocumentConverter = converter_module.DocumentConverter
 create_mdns_announcer = mdns_module.create_mdns_announcer
+LogPrinter = log_printer_module.LogPrinter
+PrinterLogHandler = log_printer_module.PrinterLogHandler
 
 # Import utility functions
 setup_logging = utils_module.setup_logging
@@ -65,36 +70,33 @@ import logging
 logger = logging.getLogger(__name__)
 
 class PrintServer:
-    """
-    Main print server application
-    
-    Coordinates all server components: IPP HTTP server, mDNS announcer,
-    printer backend, and document converter.
-    """
     
     def __init__(self, args):
-        """
-        Initialize print server
-        
-        Args:
-            args: Parsed command line arguments
-        """
+
         self.args = args
         self.ipp_server = None
         self.mdns_announcer = None
         self.printer_backend = None
         self.converter = None
+        self.log_printer = None
+        self.printer_log_handler = None
         self.signal_handler = SignalHandler()
+        self.status_task = None
         
         # Override settings from command line arguments
         if args.host:
             settings.SERVER_HOST = args.host
         if args.port:
             settings.SERVER_PORT = args.port
+        
+        # Override log printing setting
+        if args.print_logs:
+            settings.PRINT_LOGS_TO_PRINTER = True
     
     async def start(self):
-        """Start all server components"""
+
         logger.info(f"Starting {settings.PRINTER_NAME} IPP Print Server v{settings.VERSION}")
+        logger.info(f"Configured for {settings.PRINTER_WIDTH_MM}mm thermal printer @ {settings.PRINTER_DPI} DPI")
         
         try:
             # Setup signal handling
@@ -124,10 +126,33 @@ class PrintServer:
             logger.info(f"IPP URI: {settings.get_printer_uri()}")
             logger.info(f"Web interface: http://{settings.SERVER_HOST}:{settings.SERVER_PORT}/")
             
+            # Print startup banner to printer if log printing is enabled
+            if self.log_printer and self.log_printer.enabled:
+                server_info = {
+                    'version': settings.VERSION,
+                    'host': settings.SERVER_HOST,
+                    'port': settings.SERVER_PORT
+                }
+                await self.log_printer.print_startup_banner(server_info)
+            
             # Print status report in debug mode
             if self.args.debug:
-                status = create_status_report()
-                logger.debug(f"Status report:\n{status}")
+                try:
+                    status = create_status_report(self.printer_backend, self.converter, self.ipp_server)
+                    logger.debug(f"Status report:\n{status}")
+                    
+                    # Also print to thermal printer if enabled
+                    if self.log_printer and self.log_printer.enabled:
+                        await self.log_printer.print_status_report(status)
+                        
+                except Exception as e:
+                    logger.warning(f"Could not generate status report: {e}")
+            
+            # Test printer connection
+            await self._test_printer_connection()
+                    
+            # Start periodic status logging
+            self.status_task = asyncio.create_task(self._periodic_status_logger())
             
             # Wait for shutdown signal
             await self.signal_handler.wait_for_shutdown()
@@ -141,20 +166,96 @@ class PrintServer:
         finally:
             await self.stop()
     
+    async def _test_printer_connection(self):
+
+        if not self.printer_backend or not self.printer_backend.is_connected:
+            logger.warning("Cannot test printer connection - printer not connected")
+            return
+            
+        logger.info("Testing printer connection...")
+        
+        try:
+            # Create test pattern
+            test_data = b'\x1b@'  # Initialize printer
+            test_data += b'=== PRINTER TEST ===\n'
+            test_data += b'Connection: OK\n'
+            test_data += f'Width: {settings.PRINTER_WIDTH_MM}mm\n'.encode()
+            test_data += f'DPI: {settings.PRINTER_DPI}\n'.encode()
+            test_data += b'Test Pattern:\n'
+            test_data += b'################################\n'
+            test_data += b'#  ONE-POS Print Server Test  #\n'
+            test_data += b'################################\n\n'
+            
+            # Send test data
+            result = await self.printer_backend.send_raw(test_data)
+            
+            if result:
+                logger.info("✓ Printer connection test successful")
+            else:
+                logger.error("✗ Printer connection test failed")
+                
+        except Exception as e:
+            logger.error(f"Printer connection test failed: {e}")
+    
+    async def _periodic_status_logger(self):
+
+        while True:
+            try:
+                await asyncio.sleep(settings.STATUS_UPDATE_INTERVAL)
+                
+                # Basic status info - don't query printer directly to avoid issues
+                active_jobs = len(self.ipp_server.active_jobs) if self.ipp_server else 0
+                
+                status_msg = f"Server running - Active jobs: {active_jobs}"
+                
+                if self.printer_backend:
+                    if self.printer_backend.is_connected:
+                        status_msg += f" - Printer: Connected"
+                    else:
+                        # Solo intentar reconectar si hay mucho tiempo sin conexión
+                        status_msg += f" - Printer: Disconnected"
+                        # No hacer reconnect automático para evitar logs de error por permisos
+                        # El estado se actualizará automáticamente al enviar datos
+                
+                logger.info(f"STATUS - {status_msg}")
+
+            except asyncio.CancelledError:
+                logger.info("Status logger task cancelled.")
+                break
+            except Exception as e:
+                logger.error(f"Error in periodic status logger: {e}")
+
     async def _initialize_components(self):
-        """Initialize all server components"""
+
         logger.info("Initializing server components...")
         
-        # Initialize printer backend
+        # Initialize printer backend first
         self.printer_backend = create_printer_backend()
         logger.info(f"Created printer backend: {type(self.printer_backend).__name__}")
         
+        # Initialize log printer
+        self.log_printer = LogPrinter(self.printer_backend)
+        
+        # Enable log printing if configured
+        if settings.PRINT_LOGS_TO_PRINTER:
+            self.log_printer.enable(settings.PRINT_LOG_LEVELS)
+            
+            # Add printer log handler to root logger
+            self.printer_log_handler = PrinterLogHandler(self.log_printer)
+            logging.getLogger().addHandler(self.printer_log_handler)
+            
+            logger.info("Log printing to thermal printer enabled")
+        
         # Try to connect to printer
+        logger.info("Connecting to printer...")
         if await self.printer_backend.connect():
             printer_info = await self.printer_backend.get_printer_status()
-            logger.info(f"Connected to printer: {printer_info}")
+            logger.info(f"✓ Connected to printer: {printer_info}")
+            
+            # Update log printer with connected backend
+            self.log_printer.set_printer_backend(self.printer_backend)
         else:
-            logger.warning("Could not connect to printer - server will run in offline mode")
+            logger.warning("⚠ Could not connect to printer - server will run in offline mode")
         
         # Initialize document converter
         self.converter = DocumentConverter()
@@ -183,7 +284,7 @@ class PrintServer:
             logger.info("mDNS announcer disabled by user")
     
     async def _start_services(self):
-        """Start all services"""
+
         logger.info("Starting services...")
         
         # Start IPP server
@@ -201,10 +302,24 @@ class PrintServer:
         logger.info("All services started")
     
     async def stop(self):
-        """Stop all server components"""
+
         logger.info("Stopping print server...")
         
         try:
+            # Stop status logger task
+            if self.status_task:
+                self.status_task.cancel()
+                try:
+                    await self.status_task
+                except asyncio.CancelledError:
+                    pass
+                logger.info("Status logger stopped")
+
+            # Remove printer log handler
+            if self.printer_log_handler:
+                logging.getLogger().removeHandler(self.printer_log_handler)
+                logger.info("Printer log handler removed")
+
             # Stop mDNS announcer
             if self.mdns_announcer:
                 await self.mdns_announcer.stop()
@@ -225,25 +340,61 @@ class PrintServer:
         except Exception as e:
             logger.error(f"Error during shutdown: {e}")
 
+    def _show_connection_info(self):
+
+        if not self.ipp_server:
+            return
+            
+        conn_info = self.ipp_server.get_connection_info()
+        
+        print("\n" + "=" * 70)
+        print("📡 INFORMACIÓN DE CONEXIÓN PARA CLIENTES")
+        print("=" * 70)
+        print(f"🖥️  IP del servidor: {conn_info['local_ip']}")
+        print(f"🏠 Hostname: {conn_info['hostname']}")
+        print(f"🔌 Puerto: {conn_info['port']}")
+        print(f"🖼️  Plataforma: {conn_info['platform'].title()}")
+        
+        if conn_info['port_changed']:
+            print(f"⚠️  Puerto cambiado: {self.args.port or 631} → {conn_info['port']}")
+        
+        print(f"\n📄 URI IPP: {conn_info['ipp_uri']}")
+        print(f"🌐 Interfaz web: {conn_info['web_uri']}")
+        
+        print(f"\n📱 CONFIGURACIÓN PARA APLICACIONES:")
+        print(f"   Host/IP: {conn_info['local_ip']}")
+        print(f"   Puerto: {conn_info['port']}")
+        print(f"   Protocolo: IPP")
+        print(f"   Ruta: /ipp/print")
+        
+        print(f"\n📋 CONFIGURACIÓN PARA NETPRINTER:")
+        print(f"   Server: {conn_info['local_ip']}")
+        print(f"   Port: {conn_info['port']}")
+        print(f"   Queue: /ipp/print")
+        print(f"   Protocol: IPP/HTTP")
+        print("=" * 70 + "\n")
+
 def parse_arguments():
-    """Parse command line arguments"""
+
     parser = argparse.ArgumentParser(
         description="IPP Print Server for thermal printers",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-    python main.py                              # Start with default settings
-    python main.py --host 192.168.1.100        # Bind to specific IP
-    python main.py --port 8631 --debug         # Use non-standard port with debug
-    python main.py --no-mdns                    # Disable mDNS announcement
-    python main.py --log-file server.log       # Log to file
+            Examples:
+                python main.py                              # Start with default settings
+                python main.py --host 192.168.1.100        # Bind to specific IP
+                python main.py --port 8631 --debug         # Use non-standard port with debug
+                python main.py --no-mdns                    # Disable mDNS announcement
+                python main.py --print-logs                 # Print logs to thermal printer
+                python main.py --log-file server.log       # Log to file
 
-Environment Variables:
-    PRINTSERVER_HOST=0.0.0.0
-    PRINTSERVER_PORT=631
-    PRINTER_NAME="My Thermal Printer"
-    LOG_LEVEL=INFO
-        """
+            Environment Variables:
+                PRINTSERVER_HOST=0.0.0.0
+                PRINTSERVER_PORT=631
+                PRINTER_NAME="My Thermal Printer"
+                LOG_LEVEL=INFO
+                PRINT_LOGS_TO_PRINTER=false
+                    """
     )
     
     parser.add_argument('--host', 
@@ -260,6 +411,8 @@ Environment Variables:
                        help='Disable mDNS service announcement')
     parser.add_argument('--debug', action='store_true',
                        help='Enable debug mode')
+    parser.add_argument('--print-logs', action='store_true',
+                       help='Print important logs to thermal printer')
     parser.add_argument('--version', action='version',
                        version=f'IPP Print Server v{settings.VERSION}')
     
@@ -274,7 +427,7 @@ Environment Variables:
     return parser.parse_args()
 
 async def run_health_check():
-    """Run health check and exit"""
+
     print("IPP Print Server Health Check")
     print("=" * 40)
     
@@ -293,11 +446,13 @@ async def run_health_check():
     sys.exit(exit_code)
 
 def run_status_report():
-    """Run status report and exit"""
+
     print("IPP Print Server Status Report")
     print("=" * 40)
     
-    status = create_status_report()
+    # Note: This is a static report. For live status, run the server.
+    # We can't get dynamic data like printer status without starting the backend.
+    status = create_status_report(None, None, None)
     
     print(f"Server: {status['server']['name']} v{status['server']['version']}")
     print(f"URI: {status['server']['uri']}")
@@ -322,7 +477,7 @@ def run_status_report():
     sys.exit(0)
 
 async def main():
-    """Main entry point"""
+    
     try:
         # Parse arguments
         args = parse_arguments()

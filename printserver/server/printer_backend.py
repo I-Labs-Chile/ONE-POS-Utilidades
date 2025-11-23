@@ -96,18 +96,44 @@ class PrinterBackend:
             logger.info("Disconnected from printer")
     
     async def send_raw(self, data: bytes) -> bool:
-        if not self.is_connected:
-            if not await self.connect():
-                return False
         
+        if not self.is_connected:
+            logger.error("Cannot send data - printer not connected")
+            return False
+            
+        if not data:
+            logger.warning("No data to send")
+            return True
+            
         try:
-            return await self._write_data(data)
+            logger.debug(f"Sending {len(data)} bytes to printer")
+            
+            result = await self._write_data(data)
+            
+            if result:
+                logger.info(f"✓ Successfully sent {len(data)} bytes to printer")
+                # ✅ CORREGIR: Mantener el estado de conexión actualizado
+                self.is_connected = True
+                self.last_error = None
+            else:
+                logger.error(f"✗ Failed to send data to printer")
+                self.last_error = "Write operation failed"
+                # Marcar como desconectado si falla la escritura
+                self.is_connected = False
+                
+            return result
+            
         except Exception as e:
-            logger.error(f"Failed to send data to printer: {e}")
+            logger.error(f"✗ Print operation failed: {e}")
             self.last_error = str(e)
             
             # Try to reconnect on communication error
-            self.is_connected = False
+            if "device" in str(e).lower() or "communication" in str(e).lower():
+                logger.info("Attempting to reconnect due to communication error...")
+                await self.disconnect()
+                await asyncio.sleep(1)
+                await self.connect()
+                
             return False
     
     async def detect_printer(self) -> Optional[Dict[str, Any]]:
@@ -315,6 +341,10 @@ class FilePrinterBackend:
             with open(self.device_path, 'wb') as f:
                 f.write(data)
                 f.flush()
+            
+            # ✅ CORRIGIR: Actualizar estado de conexión después de escritura exitosa
+            self.is_connected = True
+            self.last_error = None
             
             logger.debug(f"Wrote {len(data)} bytes to {self.device_path}")
             return True

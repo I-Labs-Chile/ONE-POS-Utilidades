@@ -47,6 +47,11 @@ class IPPTag(IntEnum):
     NATURAL_LANGUAGE = 0x48
     MIME_MEDIA_TYPE = 0x49
 
+    @classmethod
+    def _missing_(cls, value):
+        logger.warning(f"Unknown IPPTag value: {value}")
+        return cls.UNKNOWN
+
 class IPPOperation(IntEnum):
     PRINT_JOB = 0x0002
     PRINT_URI = 0x0003
@@ -132,6 +137,7 @@ class IPPMessage:
         self.printer_attributes: Dict[str, IPPAttribute] = {}
         self.unsupported_attributes: Dict[str, IPPAttribute] = {}
         self.document_data: Optional[bytes] = None
+        self.status_code: Optional[IPPStatusCode] = None
     
     def add_operation_attribute(self, name: str, tag: IPPTag, value: Any):
         self.operation_attributes[name] = IPPAttribute(name, tag, value)
@@ -146,48 +152,57 @@ class IPPParser:
     
     @staticmethod
     def parse_request(data: bytes) -> IPPMessage:
+        # Ensure the buffer has enough bytes for the header
         if len(data) < 8:
             raise ValueError("IPP message too short")
-        
+
         stream = io.BytesIO(data)
         message = IPPMessage()
-        
+
         # Parse IPP header (8 bytes)
-        header = struct.unpack(">BBHHI", stream.read(8))
-        message.version_major = header[0]
-        message.version_minor = header[1]
-        message.operation_id = header[2]
-        message.request_id = header[3]
-        
+        header = struct.unpack(">BBHI", stream.read(8))
+        message.version_major, message.version_minor, message.operation_id, message.request_id = header
+
         logger.debug(f"Parsing IPP message: version={message.version_major}.{message.version_minor}, "
-                    f"operation={message.operation_id}, request_id={message.request_id}")
-        
+                     f"operation={message.operation_id}, request_id={message.request_id}")
+        logger.debug(f"Raw header bytes: {data[:8].hex()}")
+        logger.debug(f"Unpacked header: {header}")
+        logger.debug(f"Remaining data: {data[8:].hex()}")
+
         # Parse attributes
         current_group = None
-        
+
         while True:
             # Read tag
             tag_bytes = stream.read(1)
             if not tag_bytes:
                 break
-            
+
             tag = ord(tag_bytes)
-            
+
             if tag == IPPTag.END_OF_ATTRIBUTES_TAG:
                 # End of attributes, rest is document data
                 remaining = stream.read()
-                if remaining:
-                    message.document_data = remaining
+                logger.debug(f"Document data bytes: {remaining.hex() if remaining else 'None'}")
+                message.document_data = remaining if remaining else b""
                 break
-            
+
             # Check for group delimiter tags
             if tag in [IPPTag.OPERATION_ATTRIBUTES_TAG, IPPTag.JOB_ATTRIBUTES_TAG, 
                       IPPTag.PRINTER_ATTRIBUTES_TAG, IPPTag.UNSUPPORTED_ATTRIBUTES_TAG]:
                 current_group = tag
+                logger.debug(f"Found group delimiter: {tag}")
                 continue
-            
+
             # Parse attribute
+            logger.debug(f"Parsing attribute with tag: {tag}")
             attribute = IPPParser._parse_attribute(stream, IPPTag(tag))
+            if attribute:
+                logger.debug(f"Parsed attribute: {attribute}")
+            else:
+                logger.debug("Failed to parse attribute.")
+                continue
+
             if attribute and current_group is not None:
                 if current_group == IPPTag.OPERATION_ATTRIBUTES_TAG:
                     message.operation_attributes[attribute.name] = attribute
@@ -201,27 +216,25 @@ class IPPParser:
         return message
     
     @staticmethod
-    def _parse_attribute(stream: io.BytesIO, tag: IPPTag) -> Optional[IPPAttribute]:
+    def _parse_attribute(stream: io.BytesIO, tag: IPPTag):
         try:
-            # Read name length
-            name_len = struct.unpack(">H", stream.read(2))[0]
-            
-            # Read name
-            name = ""
-            if name_len > 0:
-                name = stream.read(name_len).decode('utf-8')
-            
-            # Read value length
-            value_len = struct.unpack(">H", stream.read(2))[0]
-            
-            # Read and parse value based on tag
-            value_bytes = stream.read(value_len) if value_len > 0 else b""
-            value = IPPParser._parse_value(tag, value_bytes)
-            
+            name_length_bytes = stream.read(2)
+            if len(name_length_bytes) < 2:
+                logger.warning("Skipping attribute: insufficient data for name length")
+                return None
+            name_length = struct.unpack(">H", name_length_bytes)[0]
+            name = stream.read(name_length).decode('utf-8')
+
+            value_length_bytes = stream.read(2)
+            if len(value_length_bytes) < 2:
+                logger.warning("Skipping attribute: insufficient data for value length")
+                return None
+            value_length = struct.unpack(">H", value_length_bytes)[0]
+            value = stream.read(value_length).decode('utf-8')
+
             return IPPAttribute(name, tag, value)
-            
         except Exception as e:
-            logger.error(f"Error parsing attribute: {e}")
+            logger.warning(f"Skipping attribute due to error: {e}")
             return None
     
     @staticmethod
@@ -263,96 +276,58 @@ class IPPParser:
             return value_bytes
     
     @staticmethod
-    def build_response(operation_id: int, request_id: int, status_code: IPPStatusCode, 
-                      attributes: Dict[str, Any]) -> bytes:
+    def build_response(operation_id: int, request_id: int, status_code: int, attributes: dict) -> bytes:
         stream = io.BytesIO()
-        
+
         # Write IPP header
-        stream.write(struct.pack(">BBHHI", 2, 1, status_code, request_id))
-        
-        # Write operation attributes group
-        stream.write(bytes([IPPTag.OPERATION_ATTRIBUTES_TAG]))
-        
-        # Add required operation attributes
-        IPPParser._write_attribute(stream, "attributes-charset", IPPTag.CHARSET, "utf-8")
-        IPPParser._write_attribute(stream, "attributes-natural-language", IPPTag.NATURAL_LANGUAGE, "en")
-        
-        # Determine attribute group type based on operation
-        if operation_id == IPPOperation.GET_PRINTER_ATTRIBUTES:
-            # Write printer attributes
-            stream.write(bytes([IPPTag.PRINTER_ATTRIBUTES_TAG]))
-            for name, value in attributes.items():
-                tag = IPPParser._get_attribute_tag(value)
-                IPPParser._write_attribute(stream, name, tag, value)
-        else:
-            # Write job attributes for job operations
-            stream.write(bytes([IPPTag.JOB_ATTRIBUTES_TAG]))
-            for name, value in attributes.items():
-                tag = IPPParser._get_attribute_tag(value)
-                IPPParser._write_attribute(stream, name, tag, value)
-        
+        stream.write(struct.pack(">BBHHI",
+                                 2, 1,  # IPP version 2.1
+                                 status_code,
+                                 0,  # Reserved
+                                 request_id))
+
+        # Write attributes
+        for name, value in attributes.items():
+            IPPParser._write_attribute(stream, name, value)
+
         # End of attributes
         stream.write(bytes([IPPTag.END_OF_ATTRIBUTES_TAG]))
-        
+
         return stream.getvalue()
     
     @staticmethod
-    def _write_attribute(stream: io.BytesIO, name: str, tag: IPPTag, value: Any):
-        # Write tag
+    def _write_attribute(stream: io.BytesIO, name: str, value: Any):
+        # Write tag (default to TEXT_WITHOUT_LANGUAGE if tag is unknown)
+        tag = IPPTag.TEXT_WITHOUT_LANGUAGE
         stream.write(bytes([tag]))
-        
+
         # Write name
         name_bytes = name.encode('utf-8')
-        stream.write(struct.pack(">H", len(name_bytes)))
+        stream.write(len(name_bytes).to_bytes(2, 'big'))
         stream.write(name_bytes)
-        
-        # Serialize value
-        value_bytes = IPPParser._serialize_value(tag, value)
-        stream.write(struct.pack(">H", len(value_bytes)))
-        stream.write(value_bytes)
-    
-    @staticmethod
-    def _serialize_value(tag: IPPTag, value: Any) -> bytes:
-        if value is None:
-            return b""
-        
-        try:
-            if tag == IPPTag.INTEGER or tag == IPPTag.ENUM:
-                return struct.pack(">I", int(value))
-            elif tag == IPPTag.BOOLEAN:
-                return bytes([1 if value else 0])
-            elif tag in [IPPTag.TEXT_WITHOUT_LANGUAGE, IPPTag.NAME_WITHOUT_LANGUAGE, 
-                        IPPTag.KEYWORD, IPPTag.URI, IPPTag.CHARSET, IPPTag.NATURAL_LANGUAGE,
-                        IPPTag.MIME_MEDIA_TYPE]:
-                return str(value).encode('utf-8')
-            elif tag == IPPTag.OCTET_STRING:
-                return value if isinstance(value, bytes) else str(value).encode('utf-8')
-            elif tag == IPPTag.RESOLUTION and isinstance(value, tuple) and len(value) >= 3:
-                return struct.pack(">IIB", value[0], value[1], value[2])
-            elif tag == IPPTag.RANGE_OF_INTEGER and isinstance(value, tuple) and len(value) >= 2:
-                return struct.pack(">II", value[0], value[1])
-            else:
-                return str(value).encode('utf-8')
-                
-        except Exception as e:
-            logger.warning(f"Error serializing value for tag {tag}: {e}")
-            return str(value).encode('utf-8')
-    
-    @staticmethod
-    def _get_attribute_tag(value: Any) -> IPPTag:
-        if isinstance(value, bool):
-            return IPPTag.BOOLEAN
+
+        # Write value
+        if isinstance(value, str):
+            value_bytes = value.encode('utf-8')
+            stream.write(len(value_bytes).to_bytes(2, 'big'))
+            stream.write(value_bytes)
         elif isinstance(value, int):
-            return IPPTag.INTEGER
-        elif isinstance(value, str):
-            # Use keyword for short strings, text for longer ones
-            return IPPTag.KEYWORD if len(value) < 50 else IPPTag.TEXT_WITHOUT_LANGUAGE
+            value_bytes = value.to_bytes(4, 'big')
+            stream.write(len(value_bytes).to_bytes(2, 'big'))
+            stream.write(value_bytes)
         elif isinstance(value, list):
-            # For lists, use the tag of the first element
-            if value and len(value) > 0:
-                return IPPParser._get_attribute_tag(value[0])
-            return IPPTag.TEXT_WITHOUT_LANGUAGE
-        elif isinstance(value, bytes):
-            return IPPTag.OCTET_STRING
+            for item in value:
+                IPPParser._write_attribute(stream, name, item)  # Recursively write list items
+        elif isinstance(value, tuple):
+            tuple_value = ' '.join(map(str, value))
+            value_bytes = tuple_value.encode('utf-8')
+            stream.write(len(value_bytes).to_bytes(2, 'big'))
+            stream.write(value_bytes)
+        elif isinstance(value, dict):
+            for key, val in value.items():
+                dict_value = f"{key}={val}"
+                value_bytes = dict_value.encode('utf-8')
+                stream.write(len(value_bytes).to_bytes(2, 'big'))
+                stream.write(value_bytes)
         else:
-            return IPPTag.TEXT_WITHOUT_LANGUAGE
+            raise ValueError(f"Unsupported attribute value type: {type(value)}")

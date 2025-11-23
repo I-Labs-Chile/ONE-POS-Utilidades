@@ -61,6 +61,10 @@ def setup_logging(log_level: str = None, log_file: str = None) -> logging.Logger
         except Exception as e:
             logger.warning(f"Failed to setup file logging: {e}")
     
+    # Configure aiohttp access logger specifically
+    aiohttp_access_logger = logging.getLogger('aiohttp.access')
+    aiohttp_access_logger.setLevel(logging.INFO)
+    
     logger.info(f"Logging initialized - Level: {level}")
     return root_logger
 
@@ -128,7 +132,7 @@ def get_system_info() -> Dict[str, Any]:
         logger.warning(f"Error getting system info: {e}")
         return {'error': str(e)}
 
-def create_status_report() -> Dict[str, Any]:
+def create_status_report(printer_backend=None, converter=None, ipp_server=None) -> Dict[str, Any]:
     report = {
         'timestamp': datetime.utcnow().isoformat() + 'Z',
         'server': {
@@ -144,8 +148,49 @@ def create_status_report() -> Dict[str, Any]:
             'printer_dpi': settings.PRINTER_DPI,
             'supported_formats': settings.SUPPORTED_FORMATS,
             'supported_operations': settings.SUPPORTED_OPERATIONS
-        }
+        },
+        'components': {}
     }
+
+    if printer_backend:
+        try:
+            # Handle async get_printer_status properly
+            if hasattr(printer_backend, 'get_printer_status'):
+                if asyncio.iscoroutinefunction(printer_backend.get_printer_status):
+                    # We can't await here in a sync function, so we'll get a simplified status
+                    status = {'connected': hasattr(printer_backend, '_connected') and getattr(printer_backend, '_connected', False)}
+                else:
+                    status = printer_backend.get_printer_status()
+            else:
+                status = 'Unknown'
+                
+            report['components']['printer_backend'] = {
+                'class': type(printer_backend).__name__,
+                'status': status
+            }
+        except Exception as e:
+            report['components']['printer_backend'] = {
+                'class': type(printer_backend).__name__,
+                'status': f'Error getting status: {e}'
+            }
+
+    if converter:
+        report['components']['converter'] = {
+            'supported_formats': converter.get_supported_formats()
+        }
+
+    if ipp_server:
+        try:
+            report['components']['ipp_server'] = {
+                'is_running': ipp_server.is_running if hasattr(ipp_server, 'is_running') else False,
+                'port': getattr(ipp_server, 'port', None),
+                'active_jobs': len(ipp_server.active_jobs) if hasattr(ipp_server, 'active_jobs') else 0
+            }
+        except Exception as e:
+            report['components']['ipp_server'] = {
+                'is_running': False,
+                'error': str(e)
+            }
     
     return report
 
