@@ -18,7 +18,15 @@ venv/
 .DS_Store
 Thumbs.db
 
-# Logs
+# Logs y debug
 debug_logs/
-.json
-.bin
+*.json
+*.bin
+*.escpos
+*.log
+
+# Test files
+test_*.png
+test_*.jpg
+test_*.pdf
+test_qr.*

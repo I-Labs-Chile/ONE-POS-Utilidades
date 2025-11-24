@@ -8,7 +8,7 @@ import io
 import os
 
 try:
-    from PIL import Image, ImageDraw, ImageFont, ImageOps
+    from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageEnhance
     HAS_PILLOW = True
 except ImportError:
     HAS_PILLOW = False
@@ -31,10 +31,23 @@ class ConversionError(Exception):
     pass
 
 class DocumentConverter:
+    """
+    Converter de documentos a formato ESC/POS para impresoras térmicas de 58mm
+    
+    Flujo de conversión:
+    1. Recibe documento en formato original (PDF, imagen, etc.)
+    2. Convierte a imagen bitmap monocromática
+    3. Optimiza para impresora térmica (contraste, dithering)
+    4. Genera comandos ESC/POS para imprimir
+    """
 
     def __init__(self):
         self.printer_width_pixels = settings.PRINTER_MAX_PIXELS
         self.printer_dpi = settings.PRINTER_DPI
+        
+        logger.info(f"DocumentConverter initialized:")
+        logger.info(f"  - Printer width: {self.printer_width_pixels} pixels")
+        logger.info(f"  - DPI: {self.printer_dpi}")
         
         # ESC/POS commands
         self.ESC = b'\x1b'
@@ -70,18 +83,86 @@ class DocumentConverter:
             return False
     
     async def convert_to_escpos(self, document_data: bytes, document_format: str) -> bytes:
-        try:
-            # Convert to bitmap image
-            bitmap = await self._convert_to_bitmap(document_data, document_format)
+        """
+        Convierte documento a formato ESC/POS
+        
+        Flujo:
+        1. Detecta formato si es 'application/octet-stream'
+        2. Si ya es ESC/POS, lo devuelve directamente
+        3. Si no, convierte a bitmap y luego a ESC/POS
+        
+        Args:
+            document_data: Datos del documento en bytes
+            document_format: Tipo MIME del documento
             
-            # Convert bitmap to ESC/POS
+        Returns:
+            Comandos ESC/POS listos para enviar a la impresora
+        """
+        try:
+            logger.info(f"Starting conversion: format={document_format}, size={len(document_data)} bytes")
+            
+            # PASO 1: Detectar formato real si es octet-stream
+            actual_format = document_format
+            if document_format == 'application/octet-stream':
+                actual_format = self._detect_format(document_data)
+                logger.info(f"Detected actual format: {actual_format}")
+            
+            # PASO 2: Si ya es ESC/POS, usar directamente
+            if actual_format == 'application/vnd.escpos' or self._is_escpos_data(document_data):
+                logger.info("Document is already in ESC/POS format, using directly")
+                return document_data
+            
+            # PASO 3: Convertir a bitmap
+            logger.debug(f"Converting {actual_format} to bitmap...")
+            bitmap = await self._convert_to_bitmap(document_data, actual_format)
+            logger.info(f"Bitmap created: {bitmap.size[0]}x{bitmap.size[1]} pixels")
+            
+            # PASO 4: Convertir bitmap a ESC/POS
+            logger.debug("Converting bitmap to ESC/POS commands...")
             escpos_data = self._bitmap_to_escpos(bitmap)
+            logger.info(f"Conversion complete: {len(escpos_data)} bytes of ESC/POS")
             
             return escpos_data
             
         except Exception as e:
             logger.error(f"Conversion failed: {e}")
+            import traceback
+            logger.debug(f"Conversion error traceback: {traceback.format_exc()}")
             raise ConversionError(f"Failed to convert {document_format}: {e}")
+    
+    def _detect_format(self, data: bytes) -> str:
+        """Detecta el formato del documento por magic bytes"""
+        if data.startswith(b'%PDF'):
+            return 'application/pdf'
+        elif data.startswith(b'\xFF\xD8\xFF'):
+            return 'image/jpeg'
+        elif data.startswith(b'\x89PNG'):
+            return 'image/png'
+        elif data.startswith(b'GIF87a') or data.startswith(b'GIF89a'):
+            return 'image/gif'
+        elif data.startswith(b'BM'):
+            return 'image/bmp'
+        elif b'\x1b' in data[:100] or b'\x1d' in data[:100]:
+            return 'application/vnd.escpos'
+        else:
+            return 'application/octet-stream'
+    
+    def _is_escpos_data(self, data: bytes) -> bool:
+        """Verifica si los datos son comandos ESC/POS"""
+        # Buscar comandos ESC/POS comunes en los primeros bytes
+        if len(data) < 10:
+            return False
+        
+        escpos_markers = [
+            b'\x1b@',      # ESC @ (Initialize)
+            b'\x1b*',      # ESC * (Bitmap)
+            b'\x1d',       # GS (Group Separator)
+            b'\x1ba',      # ESC a (Alignment)
+            b'\x1bE',      # ESC E (Bold)
+        ]
+        
+        preview = data[:100]
+        return any(marker in preview for marker in escpos_markers)
     
     async def _convert_to_bitmap(self, document_data: bytes, document_format: str) -> Image.Image:
         if document_format == "application/pdf":
@@ -177,22 +258,46 @@ class DocumentConverter:
             # Fallback: create error message image
             return self._create_error_image("PWG Raster parsing not fully implemented")
     
-    async def _convert_image_to_bitmap(self, image_data: bytes) -> Image.Image:        
+    async def _convert_image_to_bitmap(self, image_data: bytes) -> Image.Image:
+        """
+        Convierte imagen (JPEG, PNG, etc.) a bitmap 1-bit para impresora térmica
+        """
         if not HAS_PILLOW:
             raise ConversionError("Pillow not available for image processing")
         
         try:
+            logger.debug(f"Loading image from {len(image_data)} bytes")
+            
             # Load image
             image = Image.open(io.BytesIO(image_data))
+            logger.info(f"Image loaded: {image.size[0]}x{image.size[1]} pixels, format={image.format}, mode={image.mode}")
             
-            return self._prepare_image_for_thermal(image)
+            # Preparar para impresora térmica
+            prepared_image = self._prepare_image_for_thermal(image)
+            
+            return prepared_image
             
         except Exception as e:
+            logger.error(f"Image loading failed: {e}")
             raise ConversionError(f"Image conversion failed: {e}")
     
     def _prepare_image_for_thermal(self, image: Image.Image) -> Image.Image:
+        """
+        Prepara imagen para impresora térmica de 58mm
+        
+        Proceso:
+        1. Convierte a RGB si es necesario
+        2. Escala a ancho de impresora (384px) manteniendo aspecto
+        3. Mejora contraste y nitidez para mejor impresión
+        4. Convierte a escala de grises
+        5. Aplica dithering Floyd-Steinberg para convertir a 1-bit (B&N)
+        """
+        original_size = image.size
+        logger.debug(f"Preparing image: {original_size[0]}x{original_size[1]} pixels, mode={image.mode}")
+        
         # Convert to RGB if necessary
-        if image.mode != 'RGB':
+        if image.mode not in ('RGB', 'L', '1'):
+            logger.debug(f"Converting from {image.mode} to RGB")
             image = image.convert('RGB')
         
         # Calculate target size maintaining aspect ratio
@@ -203,13 +308,38 @@ class DocumentConverter:
             # Scale down maintaining aspect ratio
             scale = target_width / width
             target_height = int(height * scale)
+            logger.info(f"Scaling image: {width}x{height} -> {target_width}x{target_height}")
             image = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+        elif width < target_width:
+            # Small images: don't upscale, keep original size
+            logger.info(f"Image smaller than printer width, keeping original: {width}x{height}")
+        else:
+            logger.debug(f"Image matches printer width: {width}x{height}")
         
-        # Convert to grayscale
-        image = image.convert('L')
+        # Convert to grayscale if not already
+        if image.mode != 'L':
+            image = image.convert('L')
         
-        # Apply dithering to convert to 1-bit
+        # MEJORA 1: Aumentar contraste para impresión térmica
+        # Las impresoras térmicas necesitan mayor contraste
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(1.8)  # Aumentar contraste 80%
+        logger.debug("Applied contrast enhancement: 1.8x")
+        
+        # MEJORA 2: Aumentar nitidez para mejor detalle
+        enhancer = ImageEnhance.Sharpness(image)
+        image = enhancer.enhance(2.0)  # Duplicar nitidez
+        logger.debug("Applied sharpness enhancement: 2.0x")
+        
+        # MEJORA 3: Ajustar brillo si es necesario (opcional)
+        enhancer = ImageEnhance.Brightness(image)
+        image = enhancer.enhance(1.1)  # Aumentar brillo ligeramente
+        logger.debug("Applied brightness enhancement: 1.1x")
+        
+        # MEJORA 4: Aplicar dithering Floyd-Steinberg para convertir a 1-bit
+        # Esto distribuye el error de cuantización para mejor calidad visual
         image = image.convert('1', dither=Image.Dither.FLOYDSTEINBERG)
+        logger.info(f"Image prepared for thermal printing: {image.size[0]}x{image.size[1]} pixels, 1-bit B&W")
         
         return image
     
@@ -253,58 +383,159 @@ class DocumentConverter:
         
         return image
     
-    def _bitmap_to_escpos(self, image: Image.Image) -> bytes:        
+    def _bitmap_to_escpos(self, image: Image.Image) -> bytes:
+        """
+        Convierte imagen bitmap a comandos ESC/POS
+        
+        Usa el método ESC * 33 (24-dot double-density) que es el más compatible
+        con impresoras térmicas. Procesa la imagen en franjas de 24 píxeles de alto.
+        
+        Formato ESC/POS:
+        - ESC @ : Inicializar impresora
+        - ESC 3 n : Establecer espaciado de línea
+        - ESC a n : Alineación (0=izq, 1=centro, 2=der)
+        - ESC * m nL nH [data] : Imprimir bitmap
+        - GS V m : Cortar papel
+        """
         if image.mode != '1':
             image = image.convert('1')
         
         width, height = image.size
+        logger.info(f"Converting bitmap to ESC/POS: {width}x{height} pixels")
         
         # ESC/POS bitmap printing commands
         escpos_data = io.BytesIO()
         
-        # Initialize printer
-        escpos_data.write(self.ESC + b'@')  # Initialize printer
+        # PASO 1: Inicializar impresora
+        escpos_data.write(self.ESC + b'@')  # ESC @ : Initialize printer
+        logger.debug("Added: Initialize printer (ESC @)")
         
-        # Set line spacing to minimum
-        escpos_data.write(self.ESC + b'3' + bytes([0]))
+        # PASO 2: Configurar espaciado de línea a 0 para imágenes
+        escpos_data.write(self.ESC + b'3' + bytes([0]))  # ESC 3 n : Set line spacing to n/180 inch
+        logger.debug("Added: Set line spacing to 0 (ESC 3 0)")
         
-        # Convert image to bitmap data
-        pixels = list(image.getdata())
+        # PASO 3: Centrar la imagen
+        escpos_data.write(self.ESC + b'a' + bytes([1]))  # ESC a 1 : Center alignment
+        logger.debug("Added: Center alignment (ESC a 1)")
         
-        # Process image line by line
+        # PASO 4: Procesar imagen en franjas de 24 píxeles (método más compatible)
+        y = 0
+        strip_count = 0
+        
+        while y < height:
+            # Determinar altura de la franja (máximo 24 píxeles o lo que quede)
+            strip_height = min(24, height - y)
+            
+            # ESC * m nL nH d1...dk
+            # m = 33 (24-dot double-density, 203 DPI)
+            # nL, nH = ancho en bytes (little-endian)
+            escpos_data.write(self.ESC + b'*' + bytes([33]))  # Mode 33 = 24-dot double-density
+            escpos_data.write(width.to_bytes(2, 'little'))  # Width in dots (little-endian)
+            
+            # Procesar cada columna de la franja
+            for x in range(width):
+                # Para cada byte en la columna (hasta 3 bytes para 24 píxeles)
+                for byte_idx in range(3):  # 3 bytes = 24 bits
+                    byte_val = 0
+                    for bit_idx in range(8):
+                        pixel_y = y + (byte_idx * 8) + bit_idx
+                        if pixel_y < height:
+                            try:
+                                pixel = image.getpixel((x, pixel_y))
+                                # Para imágenes 1-bit: 0 = negro, 255 = blanco
+                                # Para ESC/POS: 1 = negro, 0 = blanco
+                                if pixel == 0:  # Píxel negro
+                                    byte_val |= (1 << (7 - bit_idx))
+                            except IndexError:
+                                pass  # Pixel fuera de rango, dejar en blanco
+                    
+                    escpos_data.write(bytes([byte_val]))
+            
+            # Line feed después de cada franja
+            escpos_data.write(b'\n')
+            
+            strip_count += 1
+            y += strip_height
+        
+        logger.debug(f"Processed {strip_count} strips of 24 pixels")
+        
+        # PASO 5: Restaurar configuración
+        escpos_data.write(self.ESC + b'2')  # ESC 2 : Reset line spacing to default
+        escpos_data.write(self.ESC + b'a' + bytes([0]))  # ESC a 0 : Left alignment
+        logger.debug("Added: Reset line spacing and alignment")
+        
+        # PASO 6: Avanzar papel
+        escpos_data.write(self.ESC + b'd' + bytes([3]))  # ESC d 3 : Feed 3 lines
+        logger.debug("Added: Feed 3 lines (ESC d 3)")
+        
+        # PASO 7: Cortar papel (corte parcial si está soportado)
+        escpos_data.write(self.GS + b'V' + bytes([66, 0]))  # GS V 66 0 : Partial cut
+        logger.debug("Added: Partial cut (GS V 66 0)")
+        
+        result = escpos_data.getvalue()
+        logger.info(f"Generated {len(result)} bytes of ESC/POS commands")
+        
+        return result
+    
+    def _bitmap_to_escpos_gs_v(self, image: Image.Image) -> bytes:
+        """
+        Método alternativo usando GS v 0 (más moderno pero menos compatible)
+        
+        Este método es más simple pero puede no funcionar en impresoras antiguas.
+        Usa GS v 0 que envía la imagen completa de una vez.
+        """
+        if image.mode != '1':
+            image = image.convert('1')
+        
+        width, height = image.size
+        logger.info(f"Converting bitmap to ESC/POS (GS v 0 method): {width}x{height} pixels")
+        
+        commands = bytearray()
+        
+        # Initialize
+        commands.extend(self.ESC + b'@')
+        logger.debug("Added: Initialize printer")
+        
+        # Center align
+        commands.extend(self.ESC + b'a' + bytes([1]))
+        logger.debug("Added: Center alignment")
+        
+        # GS v 0 m xL xH yL yH d1...dk
+        # m = mode (0 = normal, 1 = double width, 2 = double height, 3 = quadruple)
+        commands.extend(self.GS + b'v0' + bytes([0]))  # Normal mode
+        
+        # Width in bytes (cada byte = 8 píxeles horizontales)
+        byte_width = (width + 7) // 8
+        commands.extend(byte_width.to_bytes(2, 'little'))
+        logger.debug(f"Image width: {byte_width} bytes ({width} pixels)")
+        
+        # Height in dots
+        commands.extend(height.to_bytes(2, 'little'))
+        logger.debug(f"Image height: {height} pixels")
+        
+        # Image data (fila por fila)
         for y in range(height):
-            line_data = []
-            
-            # Pack pixels into bytes (8 pixels per byte)
-            for x in range(0, width, 8):
+            for byte_idx in range(byte_width):
                 byte_val = 0
-                for bit in range(8):
-                    if x + bit < width:
-                        pixel_index = y * width + x + bit
-                        if pixel_index < len(pixels) and pixels[pixel_index] == 0:  # Black pixel
-                            byte_val |= (0x80 >> bit)
-                line_data.append(byte_val)
-            
-            # Only print non-empty lines
-            if any(b != 0 for b in line_data):
-                # ESC/POS bitmap command: ESC * m nL nH data
-                escpos_data.write(self.ESC + b'*')
-                escpos_data.write(bytes([0]))  # Mode 0 (8-dot single density)
-                escpos_data.write(bytes([len(line_data) & 0xFF]))  # nL
-                escpos_data.write(bytes([(len(line_data) >> 8) & 0xFF]))  # nH
-                escpos_data.write(bytes(line_data))
-                escpos_data.write(b'\n')
-            else:
-                # Empty line
-                escpos_data.write(b'\n')
+                for bit_idx in range(8):
+                    x = (byte_idx * 8) + bit_idx
+                    if x < width:
+                        pixel = image.getpixel((x, y))
+                        if pixel == 0:  # Negro
+                            byte_val |= (1 << (7 - bit_idx))
+                commands.append(byte_val)
         
-        # Feed paper
-        escpos_data.write(b'\n\n\n')
+        logger.debug(f"Generated {len(commands) - 10} bytes of image data")
         
-        # Cut paper (if supported)
-        escpos_data.write(self.GS + b'V' + bytes([0]))
+        # Reset alignment
+        commands.extend(self.ESC + b'a' + bytes([0]))
         
-        return escpos_data.getvalue()
+        # Feed and cut
+        commands.extend(self.ESC + b'd' + bytes([3]))
+        commands.extend(self.GS + b'V' + bytes([66, 0]))
+        
+        logger.info(f"Generated {len(commands)} bytes of ESC/POS commands (GS v 0 method)")
+        return bytes(commands)
     
     def get_supported_formats(self) -> list:
         formats = ["image/jpeg", "image/png"]
