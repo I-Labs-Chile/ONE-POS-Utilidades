@@ -334,16 +334,12 @@ class IPPServer:
         return None
     
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-
         client_addr = writer.get_extra_info('peername')
         client_ip = client_addr[0] if client_addr else "unknown"
         logger.debug(f"New connection from {client_addr}")
         
         # Initialize debugging session if available
-        debug_session_id = None
         if DEBUG_ENABLED:
-
-            # Detect client type based on IP and patterns
             client_type = "android" if self._is_android_client(client_ip) else "pc"
             log_android_debug(client_ip, f"New connection from {client_type}", {
                 'client_addr': str(client_addr),
@@ -351,9 +347,10 @@ class IPPServer:
             })
         
         try:
-            # Read HTTP headers
+            # Read HTTP request line
             request_line = await reader.readline()
             if not request_line:
+                logger.debug("Empty request line, closing connection")
                 return
             
             request_line = request_line.decode('utf-8').strip()
@@ -367,8 +364,11 @@ class IPPServer:
             
             method, path, version = parts[0], parts[1], parts[2]
             
-            # Read headers
+            # Read ALL headers first
             headers = {}
+            content_length = 0
+            transfer_encoding = None
+            
             while True:
                 header_line = await reader.readline()
                 if not header_line or header_line == b'\r\n':
@@ -377,7 +377,29 @@ class IPPServer:
                 header_str = header_line.decode('utf-8').strip()
                 if ':' in header_str:
                     name, value = header_str.split(':', 1)
-                    headers[name.strip().lower()] = value.strip()
+                    header_name = name.strip().lower()
+                    header_value = value.strip()
+                    headers[header_name] = header_value
+                    
+                    # Track important headers
+                    if header_name == 'content-length':
+                        try:
+                            content_length = int(header_value)
+                        except ValueError:
+                            logger.warning(f"Invalid Content-Length: {header_value}")
+                    elif header_name == 'transfer-encoding':
+                        transfer_encoding = header_value.lower()
+            
+            # Log ALL headers for debugging
+            logger.debug(f"📋 All headers received: {json.dumps(headers, indent=2)}")
+            
+            # Special handling for chunked encoding (common in Android)
+            if transfer_encoding == 'chunked':
+                logger.info(f"🔄 Chunked transfer encoding detected from {client_ip}")
+                if DEBUG_ENABLED and self._is_android_client(client_ip):
+                    log_android_debug(client_ip, "Chunked encoding detected", {
+                        'headers': dict(headers)
+                    })
             
             # Log detailed request info for debugging
             if DEBUG_ENABLED and self._is_android_client(client_ip):
@@ -385,14 +407,18 @@ class IPPServer:
                     'method': method,
                     'path': path,
                     'headers': dict(headers),
-                    'version': version
+                    'version': version,
+                    'content_length': content_length,
+                    'transfer_encoding': transfer_encoding
                 })
             
             # Handle different endpoints
             logger.debug(f"Handling {method} request to {path}")
             
             if method == 'POST' and path in ['/ipp/print', '/ipp/printer', '/']:
-                await self._handle_ipp_request(reader, writer, headers, client_ip)
+                # Pass transfer encoding info to handler
+                await self._handle_ipp_request(reader, writer, headers, client_ip, 
+                                            content_length, transfer_encoding)
             elif method == 'GET' and path == '/':
                 await self._handle_web_interface(writer)
             elif method == 'GET' and path == '/status':
@@ -403,6 +429,8 @@ class IPPServer:
                 
         except Exception as e:
             logger.error(f"Error handling client {client_addr}: {e}")
+            import traceback
+            logger.debug(f"Client handler error: {traceback.format_exc()}")
             try:
                 await self._send_http_error(writer, 500, "Internal Server Error")
             except:
@@ -413,50 +441,109 @@ class IPPServer:
                 await writer.wait_closed()
             except:
                 pass
-    
-    async def _handle_ipp_request(self, reader: asyncio.StreamReader, 
-                                  writer: asyncio.StreamWriter, headers: dict, client_ip: str = None):
 
+    async def _handle_ipp_request(self, reader: asyncio.StreamReader, 
+                                writer: asyncio.StreamWriter, headers: dict, 
+                                client_ip: str = None, content_length: int = 0,
+                                transfer_encoding: str = None):
         client_addr = writer.get_extra_info('peername')
         if not client_ip:
             client_ip = client_addr[0] if client_addr else "unknown"
-            
+        
         try:
-            # Read content length
-            content_length = int(headers.get('content-length', 0))
-            logger.debug(f"IPP request from {client_addr} - Content-Length: {content_length}")
+            user_agent = headers.get('user-agent', 'unknown')
+            logger.info(f"📱 Client: {user_agent} from {client_ip}")
             
-            # Log for Android debugging
-            if DEBUG_ENABLED and self._is_android_client(client_ip):
-                log_android_debug(client_ip, "IPP Request received", {
-                    'content_length': content_length,
-                    'headers': dict(headers)
-                })
+            # Determine how to read the body
+            ipp_data = b''
             
-            if content_length == 0:
-                logger.warning(f"No content from {client_addr}")
+            if transfer_encoding == 'chunked':
+                # Read chunked data
+                logger.debug(f"📦 Reading chunked data from {client_ip}")
+                chunks = []
+                total_size = 0
+                
+                while True:
+                    # Read chunk size line
+                    chunk_size_line = await reader.readline()
+                    if not chunk_size_line:
+                        break
+                    
+                    # Parse chunk size (hex)
+                    try:
+                        chunk_size = int(chunk_size_line.strip(), 16)
+                    except ValueError:
+                        logger.error(f"Invalid chunk size: {chunk_size_line}")
+                        break
+                    
+                    if chunk_size == 0:
+                        # Last chunk, read trailing headers if any
+                        await reader.readline()  # Read final CRLF
+                        break
+                    
+                    # Read chunk data
+                    chunk_data = await reader.readexactly(chunk_size)
+                    chunks.append(chunk_data)
+                    total_size += chunk_size
+                    
+                    # Read trailing CRLF after chunk
+                    await reader.readline()
+                    
+                    logger.debug(f"📦 Read chunk: {chunk_size} bytes (total: {total_size})")
+                
+                ipp_data = b''.join(chunks)
+                actual_length = len(ipp_data)
+                logger.info(f"✅ Chunked transfer complete: {actual_length} bytes")
+                
+            elif content_length > 0:
+                # Read with Content-Length
+                logger.debug(f"📄 Reading {content_length} bytes from {client_ip}")
+                ipp_data = await reader.read(content_length)
+                actual_length = len(ipp_data)
+                logger.debug(f"Read {actual_length}/{content_length} bytes")
+                
+            else:
+                # Try to read whatever is available (fallback)
+                logger.warning(f"⚠️ No Content-Length or Transfer-Encoding, reading available data")
+                # Set a reasonable timeout for reading
+                try:
+                    ipp_data = await asyncio.wait_for(reader.read(10 * 1024 * 1024), timeout=5.0)
+                    actual_length = len(ipp_data)
+                    logger.info(f"📄 Read {actual_length} bytes without explicit length")
+                except asyncio.TimeoutError:
+                    logger.error("❌ Timeout reading request data")
+                    await self._send_http_error(writer, 408, "Request Timeout")
+                    return
+            
+            # Validate we have data
+            if not ipp_data or len(ipp_data) == 0:
+                logger.warning(f"⚠️ No data received from {client_addr}")
                 if DEBUG_ENABLED and self._is_android_client(client_ip):
-                    log_android_debug(client_ip, "ERROR: Empty IPP request")
+                    log_android_debug(client_ip, "ERROR: No IPP data received", {
+                        'headers': dict(headers),
+                        'content_length': content_length,
+                        'transfer_encoding': transfer_encoding
+                    })
                 await self._send_http_error(writer, 400, "No content")
                 return
             
-            # Read IPP data
-            ipp_data = await reader.read(content_length)
-            logger.debug(f"Read {len(ipp_data)} bytes from {client_addr}")
+            actual_length = len(ipp_data)
+            logger.info(f"✅ Received {actual_length} bytes of IPP data from {client_ip}")
             
             # Save request data for analysis
             if DEBUG_ENABLED and self._is_android_client(client_ip):
                 save_request_data(client_ip, ipp_data, headers, "/ipp/printer")
-                log_android_debug(client_ip, f"IPP data received: {len(ipp_data)} bytes")
+                log_android_debug(client_ip, f"IPP data received: {actual_length} bytes", {
+                    'expected': content_length if content_length > 0 else 'chunked',
+                    'received': actual_length,
+                    'data_preview': ipp_data[:100].hex() if len(ipp_data) > 0 else 'empty',
+                    'transfer_encoding': transfer_encoding
+                })
             
-            if len(ipp_data) != content_length:
-                logger.error(f"Incomplete data from {client_addr}: expected {content_length}, got {len(ipp_data)}")
-                if DEBUG_ENABLED and self._is_android_client(client_ip):
-                    log_android_debug(client_ip, "ERROR: Incomplete IPP data", {
-                        'expected': content_length,
-                        'received': len(ipp_data)
-                    })
-                await self._send_http_error(writer, 400, "Incomplete data")
+            # Validate IPP data has minimum header
+            if actual_length < 8:
+                logger.error(f"❌ IPP data too short from {client_addr}: {actual_length} bytes")
+                await self._send_http_error(writer, 400, "Invalid IPP data")
                 return
             
             # Parse IPP message
@@ -473,18 +560,22 @@ class IPPServer:
                 })
             
             if message.operation_id is None:
-                logger.error(f"Failed to parse IPP operation from {client_addr}")
+                logger.error(f"❌ Failed to parse IPP operation from {client_addr}")
                 if DEBUG_ENABLED and self._is_android_client(client_ip):
                     log_android_debug(client_ip, "ERROR: Failed to parse IPP operation")
                 await self._send_http_error(writer, 400, "Invalid IPP message")
                 return
+            
+            # Log operation details
+            operation_name = self.SUPPORTED_OPERATIONS.get(message.operation_id, f'Unknown-0x{message.operation_id:04x}')
+            logger.info(f"🔧 Processing: {operation_name} from {client_ip}")
             
             # Handle operation
             logger.debug(f"Processing IPP operation from {client_addr}")
             response_data = await self._process_ipp_operation(message, client_ip)
             
             if not response_data:
-                logger.error(f"No response data generated for {client_addr}")
+                logger.error(f"❌ No response data generated for {client_addr}")
                 await self._send_http_error(writer, 500, "Failed to process operation")
                 return
             
@@ -494,6 +585,7 @@ class IPPServer:
                 "Content-Type: application/ipp\r\n"
                 f"Content-Length: {len(response_data)}\r\n"
                 "Server: ONE-POS-IPP/1.0\r\n"
+                "Connection: close\r\n"
                 "\r\n"
             )
             
@@ -501,7 +593,7 @@ class IPPServer:
             writer.write(response_headers.encode())
             writer.write(response_data)
             await writer.drain()
-            logger.debug(f"✅ IPP response sent successfully to {client_addr}")
+            logger.info(f"✅ Response sent successfully to {client_ip}: {len(response_data)} bytes")
             
         except Exception as e:
             logger.error(f"❌ Error processing IPP request from {client_addr}: {e}")
@@ -513,7 +605,7 @@ class IPPServer:
                 pass
     
     async def _process_ipp_operation(self, message: IPPMessage, client_ip: str = None) -> bytes:
-
+        """Process IPP operation"""
         try:
             operation_name = self.SUPPORTED_OPERATIONS.get(message.operation_id, 'Unknown')
             logger.info(f"📱 Processing IPP operation: {operation_name} (0x{message.operation_id:04x})")
@@ -522,10 +614,24 @@ class IPPServer:
             logger.debug(f"Request ID: {message.request_id}, Version: {message.version_number}")
             if message.operation_attributes:
                 logger.debug(f"Operation attributes: {len(message.operation_attributes)} items")
-                for attr in message.operation_attributes[:5]:  # Log first 5 attributes
-                    logger.debug(f"  Attribute: {attr.name}={attr.value}")
+                # CORRECCIÓN: Iterar sobre el diccionario correctamente
+                for i, (attr_name, attr_value) in enumerate(message.operation_attributes.items()):
+                    if i >= 5:  # Solo mostrar los primeros 5
+                        break
+                    logger.debug(f"  Attribute: {attr_name}={attr_value.value}")
+            
+            if message.job_attributes:
+                logger.debug(f"Job attributes: {len(message.job_attributes)} items")
+                for i, (attr_name, attr_value) in enumerate(message.job_attributes.items()):
+                    if i >= 5:
+                        break
+                    logger.debug(f"  Job Attr: {attr_name}={attr_value.value}")
+            
             if message.document_data:
                 logger.info(f"📄 Document data received: {len(message.document_data)} bytes")
+                # Log preview of document data
+                preview = message.document_data[:50] if len(message.document_data) >= 50 else message.document_data
+                logger.debug(f"Document preview (hex): {preview.hex()}")
             
             # Process operation
             if message.operation_id == 0x0002:  # Print-Job
@@ -553,31 +659,67 @@ class IPPServer:
     async def _handle_print_job(self, message: IPPMessage) -> bytes:
 
         try:
-            logger.info("🖨️  Handling Print-Job from Android device")
+            logger.info("🖨️  Handling Print-Job request")
+            
+            # Log all operation attributes for debugging
+            logger.debug("Operation attributes:")
+            for attr_name, attr_value in message.operation_attributes.items():
+                logger.debug(f"  {attr_name}: {attr_value.value}")
+            
+            # Log job attributes
+            if message.job_attributes:
+                logger.debug("Job attributes:")
+                for attr_name, attr_value in message.job_attributes.items():
+                    logger.debug(f"  {attr_name}: {attr_value.value}")
             
             # Validate document data
-            if not message.document_data:
+            if not message.document_data or len(message.document_data) == 0:
                 logger.error("❌ No document data received")
                 return self._create_error_response(message.request_id, 0x0400)  # client-error-bad-request
             
-            # Get document format
+            # Get document format from operation attributes
             document_format = 'application/octet-stream'
             if 'document-format' in message.operation_attributes:
-                document_format = message.operation_attributes['document-format'].value
-                
-            logger.info(f"📄 Print job - Format: {document_format}, Size: {len(message.document_data)} bytes")
+                format_attr = message.operation_attributes['document-format']
+                if isinstance(format_attr.value, bytes):
+                    document_format = format_attr.value.decode('utf-8', errors='ignore')
+                else:
+                    document_format = str(format_attr.value)
+            
+            logger.info(f"📄 Print job details:")
+            logger.info(f"  - Format: {document_format}")
+            logger.info(f"  - Size: {len(message.document_data)} bytes")
+            logger.info(f"  - First bytes (hex): {message.document_data[:50].hex()}")
+            
+            # Check if data looks like ESC/POS commands
+            if message.document_data.startswith(b'\x1b') or b'\x1d' in message.document_data[:100]:
+                logger.info("  ✅ Document appears to contain ESC/POS commands")
+            
+            # Get job name if available
+            job_name = "Unnamed Job"
+            if 'job-name' in message.operation_attributes:
+                job_name_attr = message.operation_attributes['job-name']
+                if isinstance(job_name_attr.value, str):
+                    job_name = job_name_attr.value
+                elif isinstance(job_name_attr.value, bytes):
+                    job_name = job_name_attr.value.decode('utf-8', errors='ignore')
+            
+            logger.info(f"  - Job name: {job_name}")
             
             # Create job
             job_id = self._create_job(message)
+            logger.info(f"✅ Created job {job_id} for '{job_name}'")
             
             # Process job asynchronously
-            asyncio.create_task(self._process_print_job(job_id, message.document_data, document_format))
+            asyncio.create_task(self._process_print_job(job_id, message.document_data, document_format, job_name))
             
             # Return success response
             return self._create_print_job_response(message.request_id, job_id)
             
         except Exception as e:
-            logger.error(f"Error in print job: {e}")
+            logger.error(f"❌ Error in print job handler: {e}")
+            import traceback
+            logger.debug(f"Print job handler error: {traceback.format_exc()}")
             return self._create_error_response(message.request_id, 0x0500)  # server-error-internal-error
     
     def _create_job(self, message: IPPMessage) -> int:
@@ -598,8 +740,7 @@ class IPPServer:
         
         return job_id
     
-    async def _process_print_job(self, job_id: int, document_data: bytes, document_format: str):
-
+    async def _process_print_job(self, job_id: int, document_data: bytes, document_format: str, job_name: str = "Unnamed"):
         job = self.active_jobs.get(job_id)
         if not job:
             logger.error(f"❌ Job {job_id} not found")
@@ -607,66 +748,77 @@ class IPPServer:
 
         try:
             job['state'] = 'processing'
-            logger.info(f"🔄 Processing print job {job_id} - Format: {document_format}, Size: {len(document_data)} bytes")
+            logger.info(f"🔄 Processing job {job_id} '{job_name}'")
+            logger.info(f"   Format: {document_format}")
+            logger.info(f"   Size: {len(document_data)} bytes")
             
             # Validate document data
             if not document_data or len(document_data) == 0:
-                logger.error(f"❌ Job {job_id}: No document data received (empty content)")
+                logger.error(f"❌ Job {job_id}: No document data (empty content)")
                 job['state'] = 'aborted'
                 job['state_reasons'] = ['document-format-error']
                 return
             
-            # Log first few bytes for debugging
-            preview = document_data[:100] if len(document_data) >= 100 else document_data
-            logger.debug(f"Document preview (first {len(preview)} bytes): {preview}")
+            # Log document characteristics
+            logger.debug(f"Document first 100 bytes (hex): {document_data[:100].hex()}")
+            logger.debug(f"Document first 100 bytes (ascii): {document_data[:100]}")
             
-            # Check if this looks like a valid document
-            if document_format == 'application/pdf':
-                if not document_data.startswith(b'%PDF'):
-                    logger.warning(f"⚠️ Job {job_id}: Document claims to be PDF but doesn't start with PDF header")
-            elif document_format.startswith('image/'):
-
-                # Check common image headers
-                image_headers = {
-                    b'\xFF\xD8\xFF': 'JPEG',
-                    b'\x89PNG\r\n\x1A\n': 'PNG',
-                    b'GIF87a': 'GIF',
-                    b'GIF89a': 'GIF'
-                }
-                header_found = False
-                for header, img_type in image_headers.items():
-                    if document_data.startswith(header):
-                        logger.debug(f"✅ Detected valid {img_type} image")
-                        header_found = True
-                        break
-                if not header_found:
-                    logger.warning(f"⚠️ Job {job_id}: Document claims to be {document_format} but header not recognized")
+            # Detect actual format if claimed as octet-stream
+            actual_format = document_format
+            if document_format == 'application/octet-stream':
+                # Try to detect actual format
+                if document_data.startswith(b'%PDF'):
+                    actual_format = 'application/pdf'
+                    logger.info(f"  🔍 Detected PDF document (header: %PDF)")
+                elif document_data.startswith(b'\xFF\xD8\xFF'):
+                    actual_format = 'image/jpeg'
+                    logger.info(f"  🔍 Detected JPEG image")
+                elif document_data.startswith(b'\x89PNG'):
+                    actual_format = 'image/png'
+                    logger.info(f"  🔍 Detected PNG image")
+                elif b'\x1b' in document_data[:10] or b'\x1d' in document_data[:10]:
+                    actual_format = 'application/vnd.escpos'
+                    logger.info(f"  🔍 Detected ESC/POS commands (already in printer format)")
+                else:
+                    logger.warning(f"  ⚠️ Could not detect format, treating as raw data")
             
-            # Convert document if converter is available
+            # Process based on actual format
             escpos_data = None
-            if self.converter:
-                logger.debug(f"🔧 Converting document from {document_format} to ESC/POS")
+            
+            if actual_format == 'application/vnd.escpos' or (
+                actual_format == 'application/octet-stream' and 
+                (b'\x1b' in document_data[:100] or b'\x1d' in document_data[:100])
+            ):
+                # Already ESC/POS commands, use directly
+                logger.info(f"  ✅ Document is already in ESC/POS format, using directly")
+                escpos_data = document_data
+                
+            elif self.converter:
+                # Need conversion
+                logger.info(f"  🔧 Converting from {actual_format} to ESC/POS")
                 try:
-                    escpos_data = await self.converter.convert_to_escpos(document_data, document_format)
+                    escpos_data = await self.converter.convert_to_escpos(document_data, actual_format)
                     if escpos_data and len(escpos_data) > 0:
-                        logger.info(f"✅ Conversion successful: {len(escpos_data)} bytes of ESC/POS data")
+                        logger.info(f"  ✅ Conversion successful: {len(escpos_data)} bytes of ESC/POS")
+                        logger.debug(f"  ESC/POS preview (hex): {escpos_data[:50].hex()}")
                     else:
-                        logger.error(f"❌ Conversion failed: No ESC/POS data generated")
+                        logger.error(f"  ❌ Conversion failed: No ESC/POS data generated")
                         job['state'] = 'aborted'
                         job['state_reasons'] = ['document-format-error']
                         return
                 except Exception as conv_error:
-                    logger.error(f"❌ Conversion error for job {job_id}: {conv_error}")
+                    logger.error(f"  ❌ Conversion error: {conv_error}")
+                    import traceback
+                    logger.debug(f"Conversion error traceback: {traceback.format_exc()}")
                     job['state'] = 'aborted'
                     job['state_reasons'] = ['document-format-error']
                     return
             else:
-
-                # Assume raw ESC/POS data
-                logger.debug("📄 No converter available, treating as raw ESC/POS data")
+                # No converter and not ESC/POS - try to use raw data anyway
+                logger.warning(f"  ⚠️ No converter available for {actual_format}, using raw data")
                 escpos_data = document_data
             
-            # Final check on ESC/POS data
+            # Final validation
             if not escpos_data or len(escpos_data) == 0:
                 logger.error(f"❌ Job {job_id}: No printable data after processing")
                 job['state'] = 'aborted'
@@ -675,21 +827,34 @@ class IPPServer:
             
             # Send to printer
             if self.printer_backend and self.printer_backend.is_connected:
-                logger.debug(f"🖨️ Sending {len(escpos_data)} bytes to printer")
-                success = await self.printer_backend.send_raw(escpos_data)
-                if success:
-                    job['state'] = 'completed'
-                    job['state_reasons'] = ['job-completed-successfully']
-                    logger.info(f"✅ Job {job_id} completed successfully - printed {len(escpos_data)} bytes")
-                else:
+                logger.info(f"  🖨️ Sending {len(escpos_data)} bytes to printer...")
+                try:
+                    success = await self.printer_backend.send_raw(escpos_data)
+                    if success:
+                        job['state'] = 'completed'
+                        job['state_reasons'] = ['job-completed-successfully']
+                        logger.info(f"  ✅ Job {job_id} printed successfully - {len(escpos_data)} bytes sent")
+                    else:
+                        job['state'] = 'aborted'
+                        job['state_reasons'] = ['printer-stopped']
+                        logger.error(f"  ❌ Job {job_id} failed - printer backend returned error")
+                except Exception as print_error:
                     job['state'] = 'aborted'
                     job['state_reasons'] = ['printer-stopped']
-                    logger.error(f"❌ Job {job_id} failed to print - printer backend error")
+                    logger.error(f"  ❌ Job {job_id} print error: {print_error}")
             else:
-                # Offline mode - mark as completed anyway for testing
+                # Offline/test mode
                 job['state'] = 'completed'
                 job['state_reasons'] = ['job-completed-with-warnings']
-                logger.warning(f"⚠️ Job {job_id} processed in offline mode - {len(escpos_data)} bytes would be printed")
+                logger.warning(f"  ⚠️ Job {job_id} processed in OFFLINE mode")
+                logger.info(f"  📝 Would have printed {len(escpos_data)} bytes")
+                
+                # Save to file for debugging
+                if DEBUG_ENABLED:
+                    debug_file = DEBUG_DIR / f"job_{job_id}_{int(time.time())}.escpos"
+                    with open(debug_file, 'wb') as f:
+                        f.write(escpos_data)
+                    logger.info(f"  💾 Saved ESC/POS data to: {debug_file}")
             
         except Exception as e:
             job['state'] = 'aborted'
@@ -698,15 +863,14 @@ class IPPServer:
             import traceback
             logger.debug(f"Job processing error traceback: {traceback.format_exc()}")
         finally:
-
-            # Move job to completed list
+            # Move job to completed/failed list
             job['completion_time'] = datetime.now()
             if job['state'] == 'completed':
                 self.completed_jobs.append(job)
-                logger.info(f"📋 Job {job_id} moved to completed jobs")
+                logger.info(f"✅ Job {job_id} completed and archived")
             else:
                 self.failed_jobs.append(job)
-                logger.warning(f"📋 Job {job_id} moved to failed jobs with state: {job['state']}")
+                logger.warning(f"❌ Job {job_id} failed with state: {job['state']}")
             
             # Remove from active jobs
             self.active_jobs.pop(job_id, None)
@@ -747,8 +911,6 @@ class IPPServer:
         return response.getvalue()
     
     async def _handle_get_printer_attributes(self, message: IPPMessage) -> bytes:
-        logger.debug("🔍 Building comprehensive printer attributes response")
-        
         response = io.BytesIO()
         
         # IPP header
@@ -756,116 +918,227 @@ class IPPServer:
         response.write((0x0000).to_bytes(2, 'big'))  # successful-ok
         response.write(message.request_id.to_bytes(4, 'big'))
         
-        # Operation attributes
-        response.write(bytes([0x01]))  # operation-attributes-tag
+        # Operation attributes group
+        response.write(bytes([0x01]))
+        
+        # Required attributes
         self._write_attribute(response, 0x47, 'attributes-charset', 'utf-8')
         self._write_attribute(response, 0x48, 'attributes-natural-language', 'en-us')
         
-        # Printer attributes
-        response.write(bytes([0x04]))  # printer-attributes-tag
+        # Printer attributes group
+        response.write(bytes([0x04]))
         
-        # Basic printer identification
-        printer_uri = f"ipp://{self.port_manager.get_network_info()['local_ip']}:{self.port}/ipp/printer"
-        self._write_attribute(response, 0x45, 'printer-uri-supported', printer_uri)
+        # Get actual network information
+        network_info = self.port_manager.get_network_info()
+        local_ip = network_info['local_ip']
+        
+        # printer-uri-supported - TODAS las variantes para máxima compatibilidad
+        printer_uris = [
+            f'ipp://{local_ip}:{self.port}/ipp/printer',
+            f'ipp://{local_ip}:{self.port}/ipp/print',
+            f'ipp://{local_ip}:{self.port}/',
+            f'http://{local_ip}:{self.port}/ipp/printer',
+        ]
+        
+        for uri in printer_uris:
+            self._write_attribute(response, 0x45, 'printer-uri-supported', uri)
+        
+        # uri-authentication-supported - para cada URI
+        for _ in printer_uris:
+            self._write_attribute(response, 0x44, 'uri-authentication-supported', 'none')
+        
+        # uri-security-supported - para cada URI
+        for _ in printer_uris:
+            self._write_attribute(response, 0x44, 'uri-security-supported', 'none')
+        
+        # printer-name
         self._write_attribute(response, 0x42, 'printer-name', settings.PRINTER_NAME)
-        self._write_attribute(response, 0x41, 'printer-info', 'ONE-POS Thermal Printer (58mm)')
-        self._write_attribute(response, 0x41, 'printer-make-and-model', 'Generic 58mm Thermal Printer')
-        self._write_attribute(response, 0x45, 'printer-device-id', 'MFG:Generic;CMD:ESC/POS;MDL:58mm Thermal;')
         
-        # Printer state and capabilities
-        state = 3 if self.printer_backend and self.printer_backend.is_connected else 4  # idle or stopped
+        # printer-location
+        self._write_attribute(response, 0x41, 'printer-location', settings.PRINTER_LOCATION)
+        
+        # printer-info
+        self._write_attribute(response, 0x41, 'printer-info', settings.PRINTER_INFO)
+        
+        # printer-make-and-model
+        self._write_attribute(response, 0x41, 'printer-make-and-model', settings.PRINTER_MAKE_MODEL)
+        
+        # printer-state (3=idle, 4=processing, 5=stopped)
+        state = 3 if self.printer_backend and self.printer_backend.is_ready() else 3  # Siempre idle si no hay backend
         self._write_attribute(response, 0x23, 'printer-state', state.to_bytes(4, 'big'))
         
         # printer-state-reasons
-        reasons = 'none' if state == 3 else 'offline'
+        reasons = 'none'
         self._write_attribute(response, 0x44, 'printer-state-reasons', reasons)
         
-        # printer-is-accepting-jobs
-        accepting = 1 if state == 3 else 0  # true if idle, false if stopped
-        self._write_attribute(response, 0x22, 'printer-is-accepting-jobs', accepting.to_bytes(1, 'big'))
+        # printer-is-accepting-jobs - SIEMPRE TRUE para testing
+        self._write_attribute(response, 0x22, 'printer-is-accepting-jobs', (1).to_bytes(1, 'big'))
         
         # operations-supported
         for op_id in self.SUPPORTED_OPERATIONS.keys():
             self._write_attribute(response, 0x23, 'operations-supported', op_id.to_bytes(4, 'big'))
         
-        # document-format-supported
+        # document-format-supported - ORDEN IMPORTANTE: preferir formatos raw primero
         formats = [
+            'application/octet-stream',  # Raw - PRIMERO para que Android lo prefiera
+            'image/pwg-raster',          # PWG Raster - formato estándar IPP
+            'application/vnd.cups-raster',  # CUPS raster
+            'image/urf',                 # URF para AirPrint
             'application/pdf',
-            'image/jpeg', 
+            'image/jpeg',
             'image/png',
-            'image/pwg-raster',
             'text/plain',
-            'application/octet-stream'
         ]
         for fmt in formats:
             self._write_attribute(response, 0x49, 'document-format-supported', fmt)
         
-        # document-format-default
-        self._write_attribute(response, 0x49, 'document-format-default', 'application/pdf')
+        # document-format-default - RAW para procesamiento local
+        self._write_attribute(response, 0x49, 'document-format-default', 'application/octet-stream')
         
-        # Media and print quality attributes
-        self._write_attribute(response, 0x44, 'media-supported', 'roll_max_58_203.2x3048')
-        self._write_attribute(response, 0x44, 'media-default', 'roll_max_58_203.2x3048')
-        self._write_attribute(response, 0x44, 'media-ready', 'roll_max_58_203.2x3048')
+        # document-format-preferred - PWG Raster es el estándar
+        self._write_attribute(response, 0x49, 'document-format-preferred', 'image/pwg-raster')
+        
+        # charset-supported
+        for charset in ['utf-8', 'us-ascii']:
+            self._write_attribute(response, 0x47, 'charset-supported', charset)
+        self._write_attribute(response, 0x47, 'charset-configured', 'utf-8')
+        
+        # natural-language-supported
+        for lang in ['en-us', 'es-es', 'es']:
+            self._write_attribute(response, 0x48, 'natural-language-supported', lang)
+        self._write_attribute(response, 0x48, 'natural-language-configured', 'en-us')
+        
+        # Media supported - 58mm thermal roll
+        media_names = [
+            'oe_roll_58mm',              # Nombre genérico
+            'om_roll_58_203.2x3048',     # Formato Mopria
+            'roll_max_58_203.2x3048',
+            'custom_58x3048mm',
+            'continuous_58x3048mm',
+        ]
+        for media in media_names:
+            self._write_attribute(response, 0x44, 'media-supported', media)
+        
+        self._write_attribute(response, 0x44, 'media-default', 'oe_roll_58mm')
+        self._write_attribute(response, 0x44, 'media-ready', 'oe_roll_58mm')
+        
+        # media-col-supported (atributos de media collection)
+        media_col_attrs = ['media-size', 'media-type', 'media-source']
+        for attr in media_col_attrs:
+            self._write_attribute(response, 0x44, 'media-col-supported', attr)
+        
+        # media-type-supported
+        self._write_attribute(response, 0x44, 'media-type-supported', 'continuous')
+        self._write_attribute(response, 0x44, 'media-source-supported', 'main')
         
         # Print quality
-        self._write_attribute(response, 0x23, 'print-quality-supported', (3).to_bytes(4, 'big'))  # draft
-        self._write_attribute(response, 0x23, 'print-quality-supported', (4).to_bytes(4, 'big'))  # normal  
-        self._write_attribute(response, 0x23, 'print-quality-supported', (5).to_bytes(4, 'big'))  # high
-        self._write_attribute(response, 0x23, 'print-quality-default', (4).to_bytes(4, 'big'))  # normal
+        for quality in [3, 4, 5]:  # draft, normal, high
+            self._write_attribute(response, 0x23, 'print-quality-supported', quality.to_bytes(4, 'big'))
+        self._write_attribute(response, 0x23, 'print-quality-default', (4).to_bytes(4, 'big'))
         
         # Color capabilities
-        self._write_attribute(response, 0x22, 'color-supported', (0).to_bytes(1, 'big'))  # false (monochrome)
+        self._write_attribute(response, 0x22, 'color-supported', (0).to_bytes(1, 'big'))
+        self._write_attribute(response, 0x44, 'print-color-mode-supported', 'monochrome')
+        self._write_attribute(response, 0x44, 'print-color-mode-default', 'monochrome')
         
-        # Resolution
-        # 203 DPI in both directions
-        resolution = (203).to_bytes(4, 'big') + (203).to_bytes(4, 'big') + (3).to_bytes(1, 'big')  # 3 = dpi
+        # Resolution - 203 DPI (8 dots/mm)
+        resolution = (203).to_bytes(4, 'big') + (203).to_bytes(4, 'big') + (3).to_bytes(1, 'big')
         self._write_attribute(response, 0x32, 'printer-resolution-supported', resolution)
         self._write_attribute(response, 0x32, 'printer-resolution-default', resolution)
         
-        # Charset and language support
-        self._write_attribute(response, 0x47, 'charset-supported', 'utf-8')
-        self._write_attribute(response, 0x47, 'charset-configured', 'utf-8')
-        self._write_attribute(response, 0x48, 'natural-language-configured', 'en-us')
-        self._write_attribute(response, 0x48, 'generated-natural-language-supported', 'en-us')
+        # PWG Raster capabilities
+        self._write_attribute(response, 0x44, 'pwg-raster-document-type-supported', 'black_1')
+        self._write_attribute(response, 0x44, 'pwg-raster-document-sheet-back', 'normal')
+        self._write_attribute(response, 0x21, 'pwg-raster-document-resolution-supported', resolution)
         
-        # URI schemes
-        self._write_attribute(response, 0x45, 'uri-schemes-supported', 'ipp')
-        self._write_attribute(response, 0x45, 'uri-schemes-supported', 'http')
+        # Sides (impresión duplex)
+        self._write_attribute(response, 0x44, 'sides-supported', 'one-sided')
+        self._write_attribute(response, 0x44, 'sides-default', 'one-sided')
+        
+        # Orientation
+        for orientation in [3, 4, 5, 6]:  # portrait, landscape, reverse-portrait, reverse-landscape
+            self._write_attribute(response, 0x23, 'orientation-requested-supported', orientation.to_bytes(4, 'big'))
+        self._write_attribute(response, 0x23, 'orientation-requested-default', (3).to_bytes(4, 'big'))
+        
+        # Compression
+        for compression in ['none', 'gzip', 'deflate']:
+            self._write_attribute(response, 0x44, 'compression-supported', compression)
+        
+        # IPP versions
+        for version in ['1.1', '2.0', '2.1', '2.2']:
+            self._write_attribute(response, 0x44, 'ipp-versions-supported', version)
+        
+        # ipp-features-supported
+        for feature in ['ipp-everywhere', 'none']:
+            self._write_attribute(response, 0x44, 'ipp-features-supported', feature)
         
         # Job management
-        self._write_attribute(response, 0x21, 'job-priority-supported', (1).to_bytes(4, 'big'))
+        self._write_attribute(response, 0x21, 'job-priority-supported', (100).to_bytes(4, 'big'))
         self._write_attribute(response, 0x21, 'job-priority-default', (50).to_bytes(4, 'big'))
-        self._write_attribute(response, 0x21, 'job-hold-until-supported', (1).to_bytes(4, 'big'))
-        self._write_attribute(response, 0x44, 'job-hold-until-default', 'no-hold')
+        self._write_attribute(response, 0x21, 'copies-supported', (1).to_bytes(4, 'big') + (99).to_bytes(4, 'big'))
+        self._write_attribute(response, 0x21, 'copies-default', (1).to_bytes(4, 'big'))
         
         # PDL override
         self._write_attribute(response, 0x44, 'pdl-override-supported', 'not-attempted')
         
-        # Compression
-        self._write_attribute(response, 0x44, 'compression-supported', 'none')
+        # Finishings
+        self._write_attribute(response, 0x23, 'finishings-supported', (3).to_bytes(4, 'big'))  # none
+        self._write_attribute(response, 0x23, 'finishings-default', (3).to_bytes(4, 'big'))
         
-        # IPP versions
-        self._write_attribute(response, 0x44, 'ipp-versions-supported', '1.1')
-        self._write_attribute(response, 0x44, 'ipp-versions-supported', '2.0')
+        # Page ranges
+        self._write_attribute(response, 0x22, 'page-ranges-supported', (1).to_bytes(1, 'big'))
         
-        # Printer up time (seconds since start)
-        import time
-        uptime = int(time.time() - getattr(self, '_start_time', time.time()))
+        # Multiple document handling
+        self._write_attribute(response, 0x44, 'multiple-document-handling-supported', 'separate-documents-uncollated-copies')
+        
+        # Printer more info
+        more_info = f'http://{local_ip}:{self.port}/'
+        self._write_attribute(response, 0x45, 'printer-more-info', more_info)
+        
+        # Device UUID
+        uuid_value = settings.MDNS_TXT_RECORDS.get('UUID', '12345678-1234-1234-1234-123456789012')
+        self._write_attribute(response, 0x45, 'printer-uuid', f'urn:uuid:{uuid_value}')
+        
+        # printer-device-id (formato IEEE 1284)
+        device_id = f'MFG:{settings.PRINTER_MAKE_MODEL.split()[0]};MDL:{settings.PRINTER_NAME};CLS:PRINTER;DES:Thermal Receipt Printer;CMD:ESC/POS;'
+        self._write_attribute(response, 0x41, 'printer-device-id', device_id)
+        
+        # Printer kind
+        for kind in ['document', 'receipt']:
+            self._write_attribute(response, 0x44, 'printer-kind', kind)
+        
+        # URI schemes
+        for scheme in ['ipp', 'http']:
+            self._write_attribute(response, 0x45, 'uri-scheme-supported', scheme)
+        
+        # which-jobs-supported
+        for which in ['completed', 'not-completed', 'all']:
+            self._write_attribute(response, 0x44, 'which-jobs-supported', which)
+        
+        # printer-up-time (seconds since start)
+        uptime = int(time.time() - self._start_time)
         self._write_attribute(response, 0x21, 'printer-up-time', uptime.to_bytes(4, 'big'))
         
-        # Printer current time
-        current_time = int(time.time())
-        self._write_attribute(response, 0x21, 'printer-current-time', current_time.to_bytes(4, 'big'))
-        
-        # Multiple document jobs
-        self._write_attribute(response, 0x22, 'multiple-document-jobs-supported', (0).to_bytes(1, 'big'))  # false
-        
-        logger.debug("✅ Printer attributes response built successfully")
+        # printer-current-time
+        now = datetime.now()
+        current_time = (
+            now.year.to_bytes(2, 'big') +
+            now.month.to_bytes(1, 'big') +
+            now.day.to_bytes(1, 'big') +
+            now.hour.to_bytes(1, 'big') +
+            now.minute.to_bytes(1, 'big') +
+            now.second.to_bytes(1, 'big') +
+            (0).to_bytes(1, 'big') +  # deciseconds
+            b'+' +  # direction from UTC
+            (0).to_bytes(1, 'big') +  # hours from UTC
+            (0).to_bytes(1, 'big')    # minutes from UTC
+        )
+        self._write_attribute(response, 0x31, 'printer-current-time', current_time)
         
         # End of attributes
         response.write(bytes([0x03]))
         
+        logger.debug(f"✅ Generated printer attributes response: {len(response.getvalue())} bytes")
         return response.getvalue()
     
     async def _handle_get_jobs(self, message: IPPMessage) -> bytes:

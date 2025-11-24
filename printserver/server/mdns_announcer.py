@@ -1,10 +1,11 @@
+from typing import Optional, Dict, Any, Union
+import threading
 import asyncio
 import logging
 import socket
-from typing import Optional, Dict, Any, Union
-import threading
 import time
 
+# Importaciones con fallbacks de seguridad
 try:
     from zeroconf import Zeroconf, ServiceInfo
     from zeroconf.asyncio import AsyncZeroconf
@@ -12,7 +13,7 @@ try:
 except ImportError:
     HAS_ZEROCONF = False
 
-# Try relative import first, fallback to absolute  
+# Importaciones de configuración con fallback
 try:
     from ..config.settings import settings
 except ImportError:
@@ -102,104 +103,69 @@ class MDNSAnnouncer:
     async def _register_ipp_service(self):
         service_name = f"{settings.MDNS_SERVICE_NAME}._ipp._tcp.local."
         
-        # Create TXT record for IPP service
+        # Get actual local IP
+        local_ip = self.server_host
+        if local_ip == '0.0.0.0':
+            local_ip = self._get_local_ip()
+        
+        # Create TXT record for IPP service - optimizado para Android/Mopria
         txt_record = {
             'txtvers': '1',
             'qtotal': '1',
             'rp': 'ipp/printer',
             'ty': settings.PRINTER_MAKE_MODEL,
-            'adminurl': f'http://{self.server_host}:{self.server_port}/',
+            'adminurl': f'http://{local_ip}:{self.server_port}/',
             'note': settings.PRINTER_INFO,
             'priority': '0',
             'product': f'({settings.PRINTER_MAKE_MODEL})',
-            'pdl': ','.join(settings.SUPPORTED_FORMATS),
+            
+            # Formatos soportados - CRÍTICO para Android
+            'pdl': 'application/pdf,application/octet-stream,image/jpeg,image/png,image/pwg-raster',
+            
+            # Capabilities
             'Color': 'F',  # Monochrome
             'Duplex': 'F',  # No duplex
             'Bind': 'F',
             'Sort': 'F',
             'Collate': 'F',
-            'PaperMax': '<legal-A4',
+            'PaperMax': 'om_roll_58_203.2x3048',
+            
+            # URF para AirPrint
+            'URF': 'W8,SRGB24,CP1,RS300,DM1',
+            
+            # UUID único
             'UUID': settings.MDNS_TXT_RECORDS.get('UUID', '12345678-1234-1234-1234-123456789012'),
+            
+            # Seguridad
             'TLS': '1.2',
-            'air': 'username,password',
-            'URF': 'W8,SRGB24,CP1,RS300'  # Universal Raster Format capabilities
-        }
+            'air': 'none',  # Sin autenticación
+            
+            # Información de media
+            'kind': 'document',
+            'PaperCustom': 'T',
+            
+            # Capacidades binarias
+            'Binary': 'T',
+            'Transparent': 'T',
+            'TBCP': 'F',
+            
+            # IPP everywhere
+            'rfo': 'ipp/print',
+            'printer-type': '0x801046',  # Tipo de impresora IPP
+            }
         
         service_info = ServiceInfo(
             "_ipp._tcp.local.",
             service_name,
-            addresses=[socket.inet_aton(self.server_host)],
+            addresses=[socket.inet_aton(local_ip)],
             port=self.server_port,
             properties=txt_record,
-            server=f"{settings.MDNS_SERVICE_NAME}.local."
-        )
+            server=f"{socket.gethostname()}.local.")
         
         await self.zeroconf.async_register_service(service_info)
         self.services["ipp"] = service_info
         
-        logger.info(f"Registered IPP service: {service_name}")
-    
-    async def _register_printer_service(self):
-        service_name = f"{settings.MDNS_SERVICE_NAME}._printer._tcp.local."
-        
-        txt_record = {
-            'txtvers': '1',
-            'ty': settings.PRINTER_MAKE_MODEL,
-            'product': f'({settings.PRINTER_MAKE_MODEL})',
-            'note': settings.PRINTER_INFO,
-            'qtotal': '1',
-            'rp': 'ipp/printer',
-            'adminurl': f'http://{self.server_host}:{self.server_port}/',
-            'priority': '0'
-        }
-        
-        service_info = ServiceInfo(
-            "_printer._tcp.local.",
-            service_name,
-            addresses=[socket.inet_aton(self.server_host)],
-            port=self.server_port,
-            properties=txt_record,
-            server=f"{settings.MDNS_SERVICE_NAME}.local."
-        )
-        
-        await self.zeroconf.async_register_service(service_info)
-        self.services["printer"] = service_info
-        
-        logger.info(f"Registered printer service: {service_name}")
-    
-    async def _register_pdl_service(self):
-        service_name = f"{settings.MDNS_SERVICE_NAME}._pdl-datastream._tcp.local."
-        
-        txt_record = {
-            'txtvers': '1',
-            'ty': settings.PRINTER_MAKE_MODEL,
-            'product': f'({settings.PRINTER_MAKE_MODEL})',
-            'note': settings.PRINTER_INFO,
-            'qtotal': '1',
-            'pdl': ','.join(settings.SUPPORTED_FORMATS),
-            'rp': 'ipp/printer',
-            'adminurl': f'http://{self.server_host}:{self.server_port}/',
-            'priority': '0',
-            'Color': 'F',
-            'Duplex': 'F',
-            'Bind': 'F',
-            'Sort': 'F',
-            'Collate': 'F'
-        }
-        
-        service_info = ServiceInfo(
-            "_pdl-datastream._tcp.local.",
-            service_name,
-            addresses=[socket.inet_aton(self.server_host)],
-            port=self.server_port,
-            properties=txt_record,
-            server=f"{settings.MDNS_SERVICE_NAME}.local."
-        )
-        
-        await self.zeroconf.async_register_service(service_info)
-        self.services["pdl"] = service_info
-        
-        logger.info(f"Registered PDL service: {service_name}")
+        logger.info(f"Registered IPP service: {service_name} at {local_ip}:{self.server_port}")
     
     async def _register_airprint_service(self):
         # AirPrint uses the same _ipp._tcp service but with specific TXT records

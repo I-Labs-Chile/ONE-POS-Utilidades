@@ -123,7 +123,7 @@ class PrintServerSettings:
         
         host = cls.SERVER_HOST
         if host == '0.0.0.0':
-            # Obtener la IP real de la máquina (multiplataforma)
+            # Get actual local IP
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                     s.settimeout(1)

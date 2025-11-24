@@ -17,3 +17,8 @@ venv/
 # Archivos temporales del sistema
 .DS_Store
 Thumbs.db
+
+# Logs
+debug_logs/
+.json
+.bin

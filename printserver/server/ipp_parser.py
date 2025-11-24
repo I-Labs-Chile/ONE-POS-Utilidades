@@ -297,37 +297,49 @@ class IPPParser:
     
     @staticmethod
     def _write_attribute(stream: io.BytesIO, name: str, value: Any):
-        # Write tag (default to TEXT_WITHOUT_LANGUAGE if tag is unknown)
-        tag = IPPTag.TEXT_WITHOUT_LANGUAGE
+        
+        # Determine appropriate tag based on value type
+        if isinstance(value, str):
+            tag = IPPTag.TEXT_WITHOUT_LANGUAGE
+            value_bytes = value.encode('utf-8')
+        elif isinstance(value, int):
+            if value <= 255:
+                tag = IPPTag.INTEGER
+                value_bytes = value.to_bytes(4, 'big', signed=True)
+            else:
+                tag = IPPTag.INTEGER
+                value_bytes = value.to_bytes(4, 'big')
+        elif isinstance(value, bool):
+            tag = IPPTag.BOOLEAN
+            value_bytes = (1 if value else 0).to_bytes(1, 'big')
+        elif isinstance(value, bytes):
+            tag = IPPTag.OCTET_STRING
+            value_bytes = value
+        elif isinstance(value, tuple) and len(value) == 3:
+            tag = IPPTag.RESOLUTION
+            value_bytes = (
+                int(value[0]).to_bytes(4, 'big') +
+                int(value[1]).to_bytes(4, 'big') +
+                int(value[2]).to_bytes(1, 'big'))
+        elif isinstance(value, list):
+            if not value:
+                return
+            IPPParser._write_attribute(stream, name, value[0])
+            for item in value[1:]:
+                IPPParser._write_attribute(stream, '', item)
+            return
+        else:
+            tag = IPPTag.TEXT_WITHOUT_LANGUAGE
+            value_bytes = str(value).encode('utf-8')
+        
+        # Write tag
         stream.write(bytes([tag]))
-
+        
         # Write name
         name_bytes = name.encode('utf-8')
         stream.write(len(name_bytes).to_bytes(2, 'big'))
         stream.write(name_bytes)
-
+        
         # Write value
-        if isinstance(value, str):
-            value_bytes = value.encode('utf-8')
-            stream.write(len(value_bytes).to_bytes(2, 'big'))
-            stream.write(value_bytes)
-        elif isinstance(value, int):
-            value_bytes = value.to_bytes(4, 'big')
-            stream.write(len(value_bytes).to_bytes(2, 'big'))
-            stream.write(value_bytes)
-        elif isinstance(value, list):
-            for item in value:
-                IPPParser._write_attribute(stream, name, item)  # Recursively write list items
-        elif isinstance(value, tuple):
-            tuple_value = ' '.join(map(str, value))
-            value_bytes = tuple_value.encode('utf-8')
-            stream.write(len(value_bytes).to_bytes(2, 'big'))
-            stream.write(value_bytes)
-        elif isinstance(value, dict):
-            for key, val in value.items():
-                dict_value = f"{key}={val}"
-                value_bytes = dict_value.encode('utf-8')
-                stream.write(len(value_bytes).to_bytes(2, 'big'))
-                stream.write(value_bytes)
-        else:
-            raise ValueError(f"Unsupported attribute value type: {type(value)}")
+        stream.write(len(value_bytes).to_bytes(2, 'big'))
+        stream.write(value_bytes)
