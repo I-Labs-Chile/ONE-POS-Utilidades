@@ -117,6 +117,17 @@ class PrintServerSettings:
     VERSION = "1.0.0"
     BUILD_DATE = "2024-11-22"
     
+    # USB Printer Settings
+    USB_PRINTER_DEVICE = os.getenv('USB_PRINTER_DEVICE', None)  # None = auto-detect
+    USB_AUTO_DETECT = os.getenv('USB_AUTO_DETECT', 'true').lower() == 'true'
+    
+    # Si se especifica un device, usarlo; sino auto-detectar
+    @classmethod
+    def get_printer_device(cls):
+        if cls.USB_PRINTER_DEVICE:
+            return cls.USB_PRINTER_DEVICE
+        return None
+    
     @classmethod
     def get_printer_uri(cls):
         import socket
