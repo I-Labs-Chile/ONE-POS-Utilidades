@@ -98,10 +98,11 @@ def parse_ipp_request(data: bytes) -> IPPMessage:
         logger.debug(f"Parsed IPP header - Version: {message.version_number}, "
                     f"Operation: 0x{message.operation_id:04x}, Request ID: {message.request_id}")
         
-        # Parse attributes (simplified)
+        # Parse attributes (RFC 8011 compliant)
         offset = 8
         current_group = None
         attr_count = 0
+        last_attribute_name = None  # Para manejar valores múltiples según RFC 8011
         
         while offset < len(data):
             if offset + 1 >= len(data):
@@ -113,14 +114,17 @@ def parse_ipp_request(data: bytes) -> IPPMessage:
             
             if tag == 0x01:  # operation-attributes-tag
                 current_group = 'operation'
+                last_attribute_name = None  # Reset en nuevo grupo
                 logger.debug("Found operation-attributes-tag")
                 continue
             elif tag == 0x02:  # job-attributes-tag
                 current_group = 'job'
+                last_attribute_name = None  # Reset en nuevo grupo
                 logger.debug("Found job-attributes-tag")
                 continue
             elif tag == 0x04:  # printer-attributes-tag
                 current_group = 'printer'
+                last_attribute_name = None  # Reset en nuevo grupo
                 logger.debug("Found printer-attributes-tag")
                 continue
             elif tag == 0x03:  # end-of-attributes-tag
@@ -130,7 +134,7 @@ def parse_ipp_request(data: bytes) -> IPPMessage:
                 message.document_data = data[offset:]
                 break
             
-            # Parse attribute (simplified)
+            # Parse attribute (RFC 8011 compliant)
             if offset + 2 >= len(data):
                 logger.debug(f"Not enough data for attribute at offset {offset}")
                 break
@@ -138,12 +142,25 @@ def parse_ipp_request(data: bytes) -> IPPMessage:
             name_length = int.from_bytes(data[offset:offset+2], 'big')
             offset += 2
             
-            if offset + name_length >= len(data):
-                logger.debug(f"Insufficient data for attribute name at offset {offset}, need {name_length} bytes")
-                break
-                
-            name = data[offset:offset+name_length].decode('utf-8', errors='ignore')
-            offset += name_length
+            # RFC 8011: Si name_length == 0, usar el último attribute-name válido
+            if name_length == 0:
+                if last_attribute_name is None:
+                    logger.warning(f"name_length == 0 but no previous attribute name available")
+                    # Intentar continuar saltando este atributo mal formado
+                    if offset + 2 <= len(data):
+                        value_length = int.from_bytes(data[offset:offset+2], 'big')
+                        offset += 2 + value_length
+                    continue
+                name = last_attribute_name
+                logger.debug(f"Using previous attribute name: {name}")
+            else:
+                if offset + name_length >= len(data):
+                    logger.debug(f"Insufficient data for attribute name at offset {offset}, need {name_length} bytes")
+                    break
+                    
+                name = data[offset:offset+name_length].decode('utf-8', errors='ignore')
+                offset += name_length
+                last_attribute_name = name  # Guardar para posibles valores múltiples
             
             if offset + 2 >= len(data):
                 logger.debug(f"No space for value length after attribute '{name}'")
@@ -163,6 +180,8 @@ def parse_ipp_request(data: bytes) -> IPPMessage:
             attr_value = AttributeValue(tag, value_data)
             attr_count += 1
             
+            # Para atributos con valores múltiples, podríamos convertirlos en listas
+            # Por ahora, simplemente sobrescribimos (último valor gana)
             if current_group == 'operation':
                 message.operation_attributes[name] = attr_value
             elif current_group == 'job':
@@ -376,7 +395,9 @@ class IPPServer:
                 
                 # EOF / cierre del cliente
                 if not request_line:
-                    logger.debug(f"[{client_ip}] EOF received from client (connection closed)")
+                    # Solo loguear si no es la primera request (para evitar spam de port scanning)
+                    if request_count > 1:
+                        logger.debug(f"[{client_ip}] EOF received from client (connection closed)")
                     break
                 
                 # TCP probe vacío (mantener conexión)
@@ -503,7 +524,9 @@ class IPPServer:
                     logger.info(f"[{client_ip}] Max requests per connection reached (100), closing")
                     break
             
-            logger.debug(f"[{client_ip}] Connection closed after {request_count} requests")
+            # Solo loguear si hubo al menos una request válida
+            if request_count > 1:
+                logger.debug(f"[{client_ip}] Connection closed after {request_count} requests")
             
         except Exception as e:
             logger.error(f"[{client_ip}] Error handling client: {e}")
@@ -661,25 +684,41 @@ class IPPServer:
                 await self._send_http_error(writer, 500, "Failed to process operation")
                 return
             
-            # Send HTTP response - Optimizado para CUPS (fix concatenation)
+            # Send HTTP response - Compatible con CUPS
+            # Determinar versión IPP para el header basado en el mensaje
+            ipp_version = f"{message.version_number[0]}.{message.version_number[1]}" if hasattr(message, 'version_number') else "2.0"
+            
             response_headers = (
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: application/ipp\r\n"
                 f"Content-Length: {len(response_data)}\r\n"
-                "Server: CUPS/2.4 IPP/2.1\r\n"
+                f"Server: IPP/{ipp_version}\r\n"  # Usar versión que respondimos en IPP
                 "Content-Language: en\r\n"
                 "Date: " + datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT') + "\r\n"
-                f"Connection: {'Keep-Alive' if keep_alive else 'close'}\r\n"
-                + ("Keep-Alive: timeout=5, max=100\r\n" if keep_alive else "")
-                + "Cache-Control: no-cache\r\n"
+                f"Connection: {'keep-alive' if keep_alive else 'close'}\r\n"
+                + ("Keep-Alive: timeout=30, max=100\r\n" if keep_alive else "")
                 + "\r\n"
             )
             
             logger.debug(f"Sending {len(response_data)} bytes response to {client_addr}")
-            writer.write(response_headers.encode())
-            writer.write(response_data)
-            await writer.drain()
-            logger.info(f"✅ Response sent successfully to {client_ip}: {len(response_data)} bytes")
+            logger.debug(f"HTTP Response headers:\n{response_headers[:200]}...")  # Log headers
+            
+            try:
+                writer.write(response_headers.encode())
+                writer.write(response_data)
+                await writer.drain()
+                
+                logger.info(f"✅ Response sent successfully to {client_ip}: {len(response_data)} bytes")
+                logger.debug(f"   HTTP headers size: {len(response_headers)} bytes")
+                logger.debug(f"   IPP body size: {len(response_data)} bytes")
+                logger.debug(f"   Total sent: {len(response_headers) + len(response_data)} bytes")
+            except ConnectionResetError as conn_err:
+                logger.warning(f"⚠️  Client {client_ip} closed connection while sending response: {conn_err}")
+                # No es un error fatal - el cliente simplemente cerró
+                return
+            except BrokenPipeError as pipe_err:
+                logger.warning(f"⚠️  Broken pipe to {client_ip}: {pipe_err}")
+                return
             
         except Exception as e:
             logger.error(f"❌ Error processing IPP request from {client_addr}: {e}")
@@ -752,7 +791,7 @@ class IPPServer:
                     logger.info(f"🛑 Job {job_id} canceled")
                     # Respuesta mínima IPP
                     response = io.BytesIO()
-                    response.write(bytes([2,0]))
+                    response.write(bytes(message.version_number))  # Usar versión del cliente
                     response.write((0x0000).to_bytes(2,'big'))  # successful-ok
                     response.write(message.request_id.to_bytes(4,'big'))
                     response.write(bytes([0x01]))  # operation-attributes
@@ -766,16 +805,17 @@ class IPPServer:
                     return response.getvalue()
                 else:
                     logger.warning("Cancel-Job requested for unknown job-id")
-                    return self._create_error_response(message.request_id, 0x0405)  # client-error-not-found
+                    return self._create_error_response(message.request_id, 0x0405, message.version_number)  # client-error-not-found
             else:
                 logger.warning(f"❌ Unsupported IPP operation: 0x{message.operation_id:04x}")
-                return self._create_error_response(message.request_id, 0x0501)  # server-error-operation-not-supported
+                return self._create_error_response(message.request_id, 0x0501, message.version_number)  # server-error-operation-not-supported
                 
         except Exception as e:
             logger.error(f"❌ Error in _process_ipp_operation: {e}")
             import traceback
             logger.debug(f"Operation processing error traceback: {traceback.format_exc()}")
-            return self._create_error_response(getattr(message, 'request_id', 1), 0x0500)  # server-error-internal-error
+            version = getattr(message, 'version_number', (2, 0))
+            return self._create_error_response(getattr(message, 'request_id', 1), 0x0500, version)  # server-error-internal-error
     
     async def _handle_print_job(self, message: IPPMessage) -> bytes:
 
@@ -796,7 +836,7 @@ class IPPServer:
             # Validate document data
             if not message.document_data or len(message.document_data) == 0:
                 logger.error("❌ No document data received")
-                return self._create_error_response(message.request_id, 0x0400)  # client-error-bad-request
+                return self._create_error_response(message.request_id, 0x0400, message.version_number)  # client-error-bad-request
             
             # Get document format from operation attributes
             document_format = 'application/octet-stream'
@@ -835,13 +875,13 @@ class IPPServer:
             asyncio.create_task(self._process_print_job(job_id, message.document_data, document_format, job_name))
             
             # Return success response
-            return self._create_print_job_response(message.request_id, job_id)
+            return self._create_print_job_response(message.request_id, job_id, message.version_number)
             
         except Exception as e:
             logger.error(f"❌ Error in print job handler: {e}")
             import traceback
             logger.debug(f"Print job handler error: {traceback.format_exc()}")
-            return self._create_error_response(message.request_id, 0x0500)  # server-error-internal-error
+            return self._create_error_response(message.request_id, 0x0500, message.version_number)  # server-error-internal-error
     
     def _create_job(self, message: IPPMessage) -> int:
 
@@ -996,11 +1036,11 @@ class IPPServer:
             # Remove from active jobs
             self.active_jobs.pop(job_id, None)
     
-    def _create_print_job_response(self, request_id: int, job_id: int) -> bytes:
+    def _create_print_job_response(self, request_id: int, job_id: int, version: tuple = (2, 0)) -> bytes:
         response = io.BytesIO()
         
-        # IPP header
-        response.write(bytes([2, 0]))  # Version 2.0
+        # IPP header - usar versión especificada o por defecto 2.0
+        response.write(bytes(version))  # Versión compatible con cliente
         response.write((0x0000).to_bytes(2, 'big'))  # successful-ok
         response.write(request_id.to_bytes(4, 'big'))  # Request ID
         
@@ -1031,11 +1071,29 @@ class IPPServer:
         
         return response.getvalue()
     
+    def _get_requested_attributes(self, message: IPPMessage) -> list:
+        """Extrae la lista de atributos solicitados del mensaje IPP"""
+        if 'requested-attributes' not in message.operation_attributes:
+            return []  # Vacío significa "todos"
+        
+        # En IPP, requested-attributes puede tener múltiples valores
+        # pero nuestro parser solo guarda el último valor
+        # Por ahora, aceptamos que solo tengamos uno
+        attr = message.operation_attributes['requested-attributes']
+        value = attr.value
+        
+        if isinstance(value, bytes):
+            return [value.decode('utf-8', errors='ignore')]
+        elif isinstance(value, str):
+            return [value]
+        else:
+            return []
+    
     async def _handle_get_printer_attributes(self, message: IPPMessage) -> bytes:
         response = io.BytesIO()
         
-        # IPP header
-        response.write(bytes([2, 0]))  # Version 2.0
+        # IPP header - usar la misma versión que el cliente
+        response.write(bytes(message.version_number))  # Respetar versión del cliente
         response.write((0x0000).to_bytes(2, 'big'))  # successful-ok
         response.write(message.request_id.to_bytes(4, 'big'))
         
@@ -1046,6 +1104,17 @@ class IPPServer:
         self._write_attribute(response, 0x47, 'attributes-charset', 'utf-8')
         self._write_attribute(response, 0x48, 'attributes-natural-language', 'en-us')
         
+        # Determinar qué atributos fueron solicitados
+        requested_attrs = self._get_requested_attributes(message)
+        
+        # Si requested_attrs está vacío o contiene 'all', enviar todos
+        send_all = not requested_attrs or 'all' in requested_attrs
+        
+        if requested_attrs and not send_all:
+            logger.info(f"📋 Client requested SPECIFIC attributes: {requested_attrs}")
+        else:
+            logger.info("📋 Sending ALL attributes (no filter requested)")
+        
         # Printer attributes group
         response.write(bytes([0x04]))
         
@@ -1053,24 +1122,174 @@ class IPPServer:
         network_info = self.port_manager.get_network_info()
         local_ip = network_info['local_ip']
         
-        # printer-uri-supported - TODAS las variantes para máxima compatibilidad
-        # CUPS prefiere URIs específicos y consistentes
+        # Definir URIs disponibles
         printer_uris = [
-            f'ipp://{local_ip}:{self.port}/ipp/printer',  # Estándar IPP
-            f'ipp://{local_ip}:{self.port}/ipp/print',    # Alternativo común
-            f'ipp://{local_ip}:{self.port}/',              # Root path
-            f'http://{local_ip}:{self.port}/ipp/printer', # HTTP fallback
-            f'ipp://{local_ip}:{self.port}/ipp',          # Sin trailing slash
+            f'ipp://{local_ip}:{self.port}/ipp/printer',
+            f'ipp://{local_ip}:{self.port}/ipp/print',
+            f'ipp://{local_ip}:{self.port}/',
+            f'http://{local_ip}:{self.port}/ipp/printer',
+            f'ipp://{local_ip}:{self.port}/ipp',
         ]
         
+        # Si se solicitan atributos específicos, solo enviarlos
+        if not send_all:
+            # Procesar cada atributo solicitado
+            for attr_name in requested_attrs:
+                if attr_name == 'printer-uri-supported':
+                    for uri in printer_uris:
+                        self._write_attribute(response, 0x45, 'printer-uri-supported', uri)
+                
+                elif attr_name == 'uri-authentication-supported':
+                    for _ in printer_uris:
+                        self._write_attribute(response, 0x44, 'uri-authentication-supported', 'none')
+                
+                elif attr_name == 'uri-security-supported':
+                    for _ in printer_uris:
+                        self._write_attribute(response, 0x44, 'uri-security-supported', 'none')
+                
+                elif attr_name == 'printer-name':
+                    self._write_attribute(response, 0x42, 'printer-name', settings.PRINTER_NAME)
+                
+                elif attr_name == 'printer-location':
+                    self._write_attribute(response, 0x41, 'printer-location', settings.PRINTER_LOCATION)
+                
+                elif attr_name == 'printer-info':
+                    self._write_attribute(response, 0x41, 'printer-info', settings.PRINTER_INFO)
+                
+                elif attr_name == 'printer-make-and-model':
+                    self._write_attribute(response, 0x41, 'printer-make-and-model', settings.PRINTER_MAKE_MODEL)
+                
+                elif attr_name == 'printer-state':
+                    if self.printer_backend and hasattr(self.printer_backend, 'is_ready'):
+                        state = 3 if self.printer_backend.is_ready() else 5
+                    elif self.printer_backend and hasattr(self.printer_backend, 'is_connected'):
+                        state = 3 if self.printer_backend.is_connected else 5
+                    else:
+                        state = 5
+                    self._write_attribute(response, 0x23, 'printer-state', state.to_bytes(4, 'big'))
+                
+                elif attr_name == 'printer-state-reasons':
+                    self._write_attribute(response, 0x44, 'printer-state-reasons', 'none')
+                
+                elif attr_name == 'printer-is-accepting-jobs':
+                    self._write_attribute(response, 0x22, 'printer-is-accepting-jobs', (1).to_bytes(1, 'big'))
+                
+                elif attr_name == 'queued-job-count':
+                    self._write_attribute(response, 0x21, 'queued-job-count', len(self.active_jobs).to_bytes(4, 'big'))
+                
+                elif attr_name == 'operations-supported':
+                    for op_id in self.SUPPORTED_OPERATIONS.keys():
+                        self._write_attribute(response, 0x23, 'operations-supported', op_id.to_bytes(4, 'big'))
+                
+                elif attr_name == 'document-format-supported':
+                    formats = ['application/octet-stream', 'image/pwg-raster', 'application/vnd.cups-raster',
+                               'image/urf', 'application/pdf', 'image/jpeg', 'image/png', 'text/plain']
+                    for fmt in formats:
+                        self._write_attribute(response, 0x49, 'document-format-supported', fmt)
+                
+                elif attr_name == 'document-format-default':
+                    self._write_attribute(response, 0x49, 'document-format-default', 'application/octet-stream')
+                
+                elif attr_name == 'charset-supported':
+                    for charset in ['utf-8', 'us-ascii']:
+                        self._write_attribute(response, 0x47, 'charset-supported', charset)
+                
+                elif attr_name == 'charset-configured':
+                    self._write_attribute(response, 0x47, 'charset-configured', 'utf-8')
+                
+                elif attr_name == 'natural-language-supported':
+                    for lang in ['en-us', 'es-es', 'es']:
+                        self._write_attribute(response, 0x48, 'natural-language-supported', lang)
+                
+                elif attr_name == 'media-supported':
+                    media_names = ['oe_roll_58mm', 'om_roll_58_203.2x3048', 'roll_max_58_203.2x3048',
+                                   'custom_58x3048mm', 'continuous_58x3048mm']
+                    for media in media_names:
+                        self._write_attribute(response, 0x44, 'media-supported', media)
+                
+                elif attr_name == 'media-default':
+                    self._write_attribute(response, 0x44, 'media-default', 'oe_roll_58mm')
+                
+                elif attr_name == 'sides-supported':
+                    self._write_attribute(response, 0x44, 'sides-supported', 'one-sided')
+                
+                elif attr_name == 'sides-default':
+                    self._write_attribute(response, 0x44, 'sides-default', 'one-sided')
+                
+                elif attr_name == 'ipp-versions-supported':
+                    for version in ['1.1', '2.0', '2.1', '2.2']:
+                        self._write_attribute(response, 0x44, 'ipp-versions-supported', version)
+                
+                elif attr_name == 'printer-type':
+                    printer_type = 0x0008 | 0x2000 | 0x10000 | 0x20000 | 0x400000
+                    self._write_attribute(response, 0x23, 'printer-type', printer_type.to_bytes(4, 'big'))
+                
+                elif attr_name == 'printer-type-mask':
+                    self._write_attribute(response, 0x23, 'printer-type-mask', (0xFFFFFFFF).to_bytes(4, 'big'))
+                
+                elif attr_name == 'printer-up-time':
+                    uptime = int(time.time() - self._start_time)
+                    self._write_attribute(response, 0x21, 'printer-up-time', uptime.to_bytes(4, 'big'))
+                
+                elif attr_name == 'color-supported':
+                    self._write_attribute(response, 0x22, 'color-supported', (0).to_bytes(1, 'big'))
+                
+                elif attr_name == 'copies-supported':
+                    self._write_attribute(response, 0x21, 'copies-supported', (1).to_bytes(4, 'big') + (99).to_bytes(4, 'big'))
+                
+                elif attr_name == 'printer-uuid':
+                    uuid_value = settings.MDNS_TXT_RECORDS.get('UUID', '12345678-1234-1234-1234-123456789012')
+                    self._write_attribute(response, 0x45, 'printer-uuid', f'urn:uuid:{uuid_value}')
+                
+                elif attr_name == 'printer-device-id':
+                    device_id = f'MFG:{settings.PRINTER_MAKE_MODEL.split()[0]};MDL:{settings.PRINTER_NAME};CLS:PRINTER;DES:Thermal Receipt Printer;CMD:ESC/POS;'
+                    self._write_attribute(response, 0x41, 'printer-device-id', device_id)
+                
+                elif attr_name == 'printer-current-time':
+                    now = datetime.now()
+                    current_time = (
+                        now.year.to_bytes(2, 'big') +
+                        now.month.to_bytes(1, 'big') +
+                        now.day.to_bytes(1, 'big') +
+                        now.hour.to_bytes(1, 'big') +
+                        now.minute.to_bytes(1, 'big') +
+                        now.second.to_bytes(1, 'big') +
+                        (0).to_bytes(1, 'big') +
+                        b'+' +
+                        (0).to_bytes(1, 'big') +
+                        (0).to_bytes(1, 'big')
+                    )
+                    self._write_attribute(response, 0x31, 'printer-current-time', current_time)
+                
+                elif attr_name == 'output-bin-supported':
+                    self._write_attribute(response, 0x44, 'output-bin-supported', 'face-down')
+                    self._write_attribute(response, 0x44, 'output-bin-default', 'face-down')
+                
+                else:
+                    logger.debug(f"⚠️ Requested attribute '{attr_name}' not implemented")
+            
+            # End of attributes
+            response.write(bytes([0x03]))
+            response_bytes = response.getvalue()
+            logger.info(f"✅ FILTERED response: {len(response_bytes)} bytes for {len(requested_attrs)} attributes")
+            
+            # Log response structure
+            logger.debug(f"Response header (hex): {response_bytes[:50].hex()}")
+            
+            return response_bytes
+        
+        # ========== MODO COMPLETO: Enviar TODOS los atributos ==========
+        logger.info("Sending complete attribute set (unfiltered)")
+        
+        # printer-uri-supported - TODAS las variantes
         for uri in printer_uris:
             self._write_attribute(response, 0x45, 'printer-uri-supported', uri)
         
-        # uri-authentication-supported - para cada URI
+        # uri-authentication-supported
         for _ in printer_uris:
             self._write_attribute(response, 0x44, 'uri-authentication-supported', 'none')
         
-        # uri-security-supported - para cada URI
+        # uri-security-supported
         for _ in printer_uris:
             self._write_attribute(response, 0x44, 'uri-security-supported', 'none')
         
@@ -1220,6 +1439,10 @@ class IPPServer:
         self._write_attribute(response, 0x23, 'finishings-supported', (3).to_bytes(4, 'big'))  # none
         self._write_attribute(response, 0x23, 'finishings-default', (3).to_bytes(4, 'big'))
         
+        # output-bin-supported (solicitado comúnmente por CUPS)
+        self._write_attribute(response, 0x44, 'output-bin-supported', 'face-down')
+        self._write_attribute(response, 0x44, 'output-bin-default', 'face-down')
+        
         # Page ranges
         self._write_attribute(response, 0x22, 'page-ranges-supported', (1).to_bytes(1, 'big'))
         
@@ -1237,10 +1460,6 @@ class IPPServer:
         # printer-device-id (formato IEEE 1284)
         device_id = f'MFG:{settings.PRINTER_MAKE_MODEL.split()[0]};MDL:{settings.PRINTER_NAME};CLS:PRINTER;DES:Thermal Receipt Printer;CMD:ESC/POS;'
         self._write_attribute(response, 0x41, 'printer-device-id', device_id)
-
-        # printer type
-        self._write_attribute(response, 0x23, 'printer-type', printer_type.to_bytes(4, 'big'))
-        logger.debug(f"Added printer-type: 0x{printer_type:06x}")
 
         # device-uri (CUPS compatibility)
         device_uri = f"usb://{settings.PRINTER_MAKE_MODEL.replace(' ', '%20')}"
@@ -1283,10 +1502,20 @@ class IPPServer:
             0x400000      # NOT_SHARED (no compartida en red por defecto)
         )
         # Resultado: 0x432008
+        
+        # printer-type-mask (requerido por RFC 8011)
+        printer_type_mask = 0xFFFFFFFF  # Mask completo
 
-        # tipo de impresora
+        # Escribir printer-type
         self._write_attribute(response, 0x23, 'printer-type', printer_type.to_bytes(4, 'big'))
         logger.debug(f"Added printer-type: 0x{printer_type:06x}")
+        
+        # Escribir printer-type-mask
+        self._write_attribute(response, 0x23, 'printer-type-mask', printer_type_mask.to_bytes(4, 'big'))
+        logger.debug(f"Added printer-type-mask: 0x{printer_type_mask:08x}")
+        
+        # Log version being sent
+        logger.debug(f"Response IPP version: {message.version_number[0]}.{message.version_number[1]}")
         
         # Printer kind
         for kind in ['document', 'receipt']:
@@ -1304,7 +1533,13 @@ class IPPServer:
         self._write_attribute(response, 0x22, 'job-ids-supported', (1).to_bytes(1, 'big'))
         
         # job-k-octets-supported - Tamaño máximo de trabajos (10MB)
-        self._write_attribute(response, 0x21, 'job-k-octets-supported', (0).to_bytes(4, 'big') + (10240).to_bytes(4, 'big'))
+        self._write_attribute(response, 0x33, 'job-k-octets-supported', (0).to_bytes(4, 'big') + (10240).to_bytes(4, 'big'))
+        
+        # job-impressions-supported (páginas/impresiones)
+        self._write_attribute(response, 0x33, 'job-impressions-supported', (0).to_bytes(4, 'big') + (999).to_bytes(4, 'big'))
+        
+        # job-media-sheets-supported (hojas de papel)
+        self._write_attribute(response, 0x33, 'job-media-sheets-supported', (0).to_bytes(4, 'big') + (999).to_bytes(4, 'big'))
         
         # printer-up-time (seconds since start)
         uptime = int(time.time() - self._start_time)
@@ -1329,14 +1564,23 @@ class IPPServer:
         # End of attributes
         response.write(bytes([0x03]))
         
-        logger.debug(f"✅ Generated printer attributes response: {len(response.getvalue())} bytes")
-        return response.getvalue()
+        response_bytes = response.getvalue()
+        logger.debug(f"✅ Generated printer attributes response: {len(response_bytes)} bytes")
+        
+        # Log first 50 bytes in hex for debugging
+        header_hex = response_bytes[:50].hex()
+        logger.debug(f"Response header (hex): {header_hex}")
+        logger.debug(f"IPP version bytes: {response_bytes[0]:02x} {response_bytes[1]:02x}")
+        logger.debug(f"Status code: {int.from_bytes(response_bytes[2:4], 'big'):04x}")
+        logger.debug(f"Request ID: {int.from_bytes(response_bytes[4:8], 'big')}")
+        
+        return response_bytes
     
     async def _handle_get_jobs(self, message: IPPMessage) -> bytes:
         response = io.BytesIO()
         
-        # IPP header
-        response.write(bytes([2, 0]))
+        # IPP header - usar versión del cliente
+        response.write(bytes(message.version_number))
         response.write((0x0000).to_bytes(2, 'big'))
         response.write(message.request_id.to_bytes(4, 'big'))
         
@@ -1369,8 +1613,8 @@ class IPPServer:
     async def _handle_validate_job(self, message: IPPMessage) -> bytes:
         response = io.BytesIO()
         
-        # IPP header
-        response.write(bytes([2, 0]))
+        # IPP header - usar versión del cliente
+        response.write(bytes(message.version_number))
         response.write((0x0000).to_bytes(2, 'big'))  # successful-ok
         response.write(message.request_id.to_bytes(4, 'big'))
         
@@ -1404,11 +1648,11 @@ class IPPServer:
         stream.write(len(value_bytes).to_bytes(2, 'big'))
         stream.write(value_bytes)
     
-    def _create_error_response(self, request_id: int, status_code: int) -> bytes:
+    def _create_error_response(self, request_id: int, status_code: int, version: tuple = (2, 0)) -> bytes:
         response = io.BytesIO()
         
-        # IPP header
-        response.write(bytes([2, 0]))  # Version 2.0
+        # IPP header - usar versión especificada
+        response.write(bytes(version))  # Versión compatible con cliente
         response.write(status_code.to_bytes(2, 'big'))
         response.write(request_id.to_bytes(4, 'big'))
         
