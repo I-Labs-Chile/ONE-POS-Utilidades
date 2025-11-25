@@ -233,7 +233,7 @@ class IPPServer:
         self.start_time = None
     
     def _is_android_client(self, client_ip: str) -> bool:
-
+        """Check if client is in Android/mobile IP patterns for enhanced debugging"""
         android_ip_patterns = [
             "192.168.1.121",
             "192.168.1.122",
@@ -336,103 +336,132 @@ class IPPServer:
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         client_addr = writer.get_extra_info('peername')
         client_ip = client_addr[0] if client_addr else "unknown"
-        logger.debug(f"New connection from {client_addr}")
         
-        # Initialize debugging session if available
+        # Get socket info for better diagnostics
+        try:
+            socket_info = writer.get_extra_info('socket')
+            logger.debug(f"New connection from {client_addr} (socket: {socket_info})")
+        except:
+            logger.debug(f"New connection from {client_addr}")
+        
+        # Detect client type (Android, Linux CUPS, etc)
+        is_android = self._is_android_client(client_ip)
+        client_type = "android" if is_android else "cups/linux"
+        
+        # Initialize debugging session
         if DEBUG_ENABLED:
-            client_type = "android" if self._is_android_client(client_ip) else "pc"
             log_android_debug(client_ip, f"New connection from {client_type}", {
                 'client_addr': str(client_addr),
                 'client_type': client_type
             })
         
         try:
-            # Read HTTP request line
-            request_line = await reader.readline()
-            if not request_line:
-                logger.debug("Empty request line, closing connection")
-                return
-            
-            request_line = request_line.decode('utf-8').strip()
-            logger.debug(f"Request line: {request_line}")
-            
-            # Parse HTTP method and path
-            parts = request_line.split()
-            if len(parts) < 3:
-                await self._send_http_error(writer, 400, "Bad Request")
-                return
-            
-            method, path, version = parts[0], parts[1], parts[2]
-            
-            # Read ALL headers first
-            headers = {}
-            content_length = 0
-            transfer_encoding = None
-            
-            while True:
-                header_line = await reader.readline()
-                if not header_line or header_line == b'\r\n':
+            keep_alive = True
+            # Loop para soportar múltiples requests en la misma conexión (CUPS)
+            while keep_alive:
+                timeout_duration = 3.0 if is_android else 10.0
+                try:
+                    request_line = await asyncio.wait_for(reader.readline(), timeout=timeout_duration)
+                except asyncio.TimeoutError:
+                    logger.debug(f"Connection timeout from {client_addr} after {timeout_duration}s, closing")
+                    if DEBUG_ENABLED:
+                        log_android_debug(client_ip, "Timeout waiting for request", {'client_type': client_type})
                     break
-                
-                header_str = header_line.decode('utf-8').strip()
-                if ':' in header_str:
-                    name, value = header_str.split(':', 1)
-                    header_name = name.strip().lower()
-                    header_value = value.strip()
-                    headers[header_name] = header_value
-                    
-                    # Track important headers
-                    if header_name == 'content-length':
-                        try:
-                            content_length = int(header_value)
-                        except ValueError:
-                            logger.warning(f"Invalid Content-Length: {header_value}")
-                    elif header_name == 'transfer-encoding':
-                        transfer_encoding = header_value.lower()
-            
-            # Log ALL headers for debugging
-            logger.debug(f"📋 All headers received: {json.dumps(headers, indent=2)}")
-            
-            # Special handling for chunked encoding (common in Android)
-            if transfer_encoding == 'chunked':
-                logger.info(f"🔄 Chunked transfer encoding detected from {client_ip}")
-                if DEBUG_ENABLED and self._is_android_client(client_ip):
-                    log_android_debug(client_ip, "Chunked encoding detected", {
-                        'headers': dict(headers)
-                    })
-            
-            # Log detailed request info for debugging
-            if DEBUG_ENABLED and self._is_android_client(client_ip):
-                log_android_debug(client_ip, f"Android request: {method} {path}", {
-                    'method': method,
-                    'path': path,
-                    'headers': dict(headers),
-                    'version': version,
-                    'content_length': content_length,
-                    'transfer_encoding': transfer_encoding
-                })
-            
-            # Handle different endpoints
-            logger.debug(f"Handling {method} request to {path}")
-            
-            if method == 'POST' and path in ['/ipp/print', '/ipp/printer', '/']:
-                # Pass transfer encoding info to handler
-                await self._handle_ipp_request(reader, writer, headers, client_ip, 
-                                            content_length, transfer_encoding)
-            elif method == 'GET' and path == '/':
-                await self._handle_web_interface(writer)
-            elif method == 'GET' and path == '/status':
-                await self._handle_status_request(writer)
-            else:
-                logger.warning(f"🚫 Unhandled request: {method} {path} from {client_addr}")
-                await self._send_http_error(writer, 404, "Not Found")
-                
+
+                # EOF / cierre
+                if not request_line:
+                    logger.debug(f"EOF from {client_addr}")
+                    break
+
+                # TCP probe vacío
+                if len(request_line.strip()) == 0:
+                    logger.info(f"🔍 Empty probe from {client_ip}")
+                    wait_time = 0.5 if is_android else 2.0
+                    await asyncio.sleep(wait_time)
+                    # Intentar siguiente iteración
+                    continue
+
+                raw_request_line = request_line[:100]
+                logger.debug(f"📄 Request line raw: {raw_request_line}")
+                request_line_str = request_line.decode('utf-8', errors='ignore').strip()
+                if not request_line_str:
+                    await self._send_http_error(writer, 400, "Bad Request", keep_alive=False)
+                    break
+
+                parts = request_line_str.split()
+                if len(parts) < 2:
+                    await self._send_http_error(writer, 400, "Bad Request", keep_alive=False)
+                    break
+
+                method, path = parts[0], parts[1]
+                version = parts[2] if len(parts) >= 3 else "HTTP/1.0"
+                if version not in ["HTTP/1.0", "HTTP/1.1"]:
+                    version = "HTTP/1.0"
+
+                # Normalizar path CUPS /printers/<queue>
+                if path.startswith('/printers/'):
+                    path = '/ipp/printer'
+
+                headers = {}
+                content_length = 0
+                transfer_encoding = None
+                expect_continue = False
+                connection_type = 'close'
+
+                while True:
+                    header_line = await reader.readline()
+                    if not header_line or header_line == b'\r\n':
+                        break
+                    h = header_line.decode('utf-8', errors='ignore').strip()
+                    if ':' in h:
+                        k, v = h.split(':', 1)
+                        k_l = k.strip().lower()
+                        v_s = v.strip()
+                        headers[k_l] = v_s
+                        if k_l == 'content-length':
+                            try:
+                                content_length = int(v_s)
+                            except ValueError:
+                                content_length = 0
+                        elif k_l == 'transfer-encoding':
+                            transfer_encoding = v_s.lower()
+                        elif k_l == 'expect' and '100-continue' in v_s.lower():
+                            expect_continue = True
+                        elif k_l == 'connection':
+                            connection_type = v_s.lower()
+
+                keep_alive = (connection_type == 'keep-alive' and version == 'HTTP/1.1')
+
+                if expect_continue:
+                    writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+                    await writer.drain()
+
+                logger.info(f"📨 {method} {path} {version} from {client_ip} keep_alive={keep_alive}")
+
+                # Routing
+                if method == 'OPTIONS':
+                    await self._handle_options_request(writer, path, keep_alive)
+                elif method == 'HEAD':
+                    await self._handle_head_request(writer, path, keep_alive)
+                elif method == 'GET' and path == '/':
+                    await self._handle_web_interface(writer)
+                elif method == 'GET' and path == '/status':
+                    await self._handle_status_request(writer)
+                elif method == 'POST' and path in ['/ipp/print', '/ipp/printer', '/ipp', '/']:
+                    await self._handle_ipp_request(reader, writer, headers, client_ip, content_length, transfer_encoding, keep_alive)
+                else:
+                    logger.warning(f"🚫 Unhandled request: {method} {path}")
+                    await self._send_http_error(writer, 404, "Not Found", keep_alive)
+
+                if not keep_alive:
+                    break
+
         except Exception as e:
             logger.error(f"Error handling client {client_addr}: {e}")
             import traceback
             logger.debug(f"Client handler error: {traceback.format_exc()}")
             try:
-                await self._send_http_error(writer, 500, "Internal Server Error")
+                await self._send_http_error(writer, 500, "Internal Server Error", keep_alive=False)
             except:
                 pass
         finally:
@@ -445,7 +474,7 @@ class IPPServer:
     async def _handle_ipp_request(self, reader: asyncio.StreamReader, 
                                 writer: asyncio.StreamWriter, headers: dict, 
                                 client_ip: str = None, content_length: int = 0,
-                                transfer_encoding: str = None):
+                                transfer_encoding: str = None, keep_alive: bool = False):
         client_addr = writer.get_extra_info('peername')
         if not client_ip:
             client_ip = client_addr[0] if client_addr else "unknown"
@@ -579,14 +608,18 @@ class IPPServer:
                 await self._send_http_error(writer, 500, "Failed to process operation")
                 return
             
-            # Send HTTP response
+            # Send HTTP response - Optimizado para CUPS (fix concatenation)
             response_headers = (
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: application/ipp\r\n"
                 f"Content-Length: {len(response_data)}\r\n"
-                "Server: ONE-POS-IPP/1.0\r\n"
-                "Connection: close\r\n"
-                "\r\n"
+                "Server: CUPS/2.4 IPP/2.1\r\n"
+                "Content-Language: en\r\n"
+                "Date: " + datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT') + "\r\n"
+                f"Connection: {'Keep-Alive' if keep_alive else 'close'}\r\n"
+                + ("Keep-Alive: timeout=5, max=100\r\n" if keep_alive else "")
+                + "Cache-Control: no-cache\r\n"
+                + "\r\n"
             )
             
             logger.debug(f"Sending {len(response_data)} bytes response to {client_addr}")
@@ -646,6 +679,41 @@ class IPPServer:
             elif message.operation_id == 0x0004:  # Validate-Job
                 logger.debug("Routing to _handle_validate_job")
                 return await self._handle_validate_job(message)
+            elif message.operation_id == 0x0008:  # Cancel-Job
+                logger.debug("Routing to Cancel-Job handler")
+                # Intentar obtener job-id
+                job_id = None
+                if 'job-id' in message.operation_attributes:
+                    try:
+                        job_id_attr = message.operation_attributes['job-id']
+                        job_id = job_id_attr.value if isinstance(job_id_attr.value, int) else int(job_id_attr.value)
+                    except Exception:
+                        job_id = None
+                # Cancelar si existe
+                if job_id and job_id in self.active_jobs:
+                    job = self.active_jobs[job_id]
+                    job['state'] = 'aborted'
+                    job['state_reasons'] = ['job-canceled-by-user']
+                    self.failed_jobs.append(job)
+                    self.active_jobs.pop(job_id, None)
+                    logger.info(f"🛑 Job {job_id} canceled")
+                    # Respuesta mínima IPP
+                    response = io.BytesIO()
+                    response.write(bytes([2,0]))
+                    response.write((0x0000).to_bytes(2,'big'))  # successful-ok
+                    response.write(message.request_id.to_bytes(4,'big'))
+                    response.write(bytes([0x01]))  # operation-attributes
+                    self._write_attribute(response, 0x47, 'attributes-charset', 'utf-8')
+                    self._write_attribute(response, 0x48, 'attributes-natural-language', 'en-us')
+                    response.write(bytes([0x02]))  # job-attributes
+                    self._write_attribute(response, 0x21, 'job-id', job_id.to_bytes(4,'big'))
+                    self._write_attribute(response, 0x23, 'job-state', (8).to_bytes(4,'big'))  # canceled/aborted
+                    self._write_attribute(response, 0x44, 'job-state-reasons', 'job-canceled-by-user')
+                    response.write(bytes([0x03]))
+                    return response.getvalue()
+                else:
+                    logger.warning("Cancel-Job requested for unknown job-id")
+                    return self._create_error_response(message.request_id, 0x0405)  # client-error-not-found
             else:
                 logger.warning(f"❌ Unsupported IPP operation: 0x{message.operation_id:04x}")
                 return self._create_error_response(message.request_id, 0x0501)  # server-error-operation-not-supported
@@ -933,11 +1001,13 @@ class IPPServer:
         local_ip = network_info['local_ip']
         
         # printer-uri-supported - TODAS las variantes para máxima compatibilidad
+        # CUPS prefiere URIs específicos y consistentes
         printer_uris = [
-            f'ipp://{local_ip}:{self.port}/ipp/printer',
-            f'ipp://{local_ip}:{self.port}/ipp/print',
-            f'ipp://{local_ip}:{self.port}/',
-            f'http://{local_ip}:{self.port}/ipp/printer',
+            f'ipp://{local_ip}:{self.port}/ipp/printer',  # Estándar IPP
+            f'ipp://{local_ip}:{self.port}/ipp/print',    # Alternativo común
+            f'ipp://{local_ip}:{self.port}/',              # Root path
+            f'http://{local_ip}:{self.port}/ipp/printer', # HTTP fallback
+            f'ipp://{local_ip}:{self.port}/ipp',          # Sin trailing slash
         ]
         
         for uri in printer_uris:
@@ -964,17 +1034,29 @@ class IPPServer:
         self._write_attribute(response, 0x41, 'printer-make-and-model', settings.PRINTER_MAKE_MODEL)
         
         # printer-state (3=idle, 4=processing, 5=stopped)
-        state = 3 if self.printer_backend and self.printer_backend.is_ready() else 3  # Siempre idle si no hay backend
+        # Check printer backend status properly
+        if self.printer_backend and hasattr(self.printer_backend, 'is_ready'):
+            if self.printer_backend.is_ready():
+                state = 3  # idle - printer is ready
+            else:
+                state = 5  # stopped - printer not ready
+        elif self.printer_backend and hasattr(self.printer_backend, 'is_connected'):
+            state = 3 if self.printer_backend.is_connected else 5
+        else:
+            state = 5  # stopped - no backend available
         self._write_attribute(response, 0x23, 'printer-state', state.to_bytes(4, 'big'))
         
         # printer-state-reasons
         reasons = 'none'
         self._write_attribute(response, 0x44, 'printer-state-reasons', reasons)
         
-        # printer-is-accepting-jobs - SIEMPRE TRUE para testing
+        # printer-is-accepting-jobs - CRUCIAL para CUPS
         self._write_attribute(response, 0x22, 'printer-is-accepting-jobs', (1).to_bytes(1, 'big'))
         
-        # operations-supported
+        # queued-job-count - CUPS lo revisa
+        self._write_attribute(response, 0x21, 'queued-job-count', len(self.active_jobs).to_bytes(4, 'big'))
+        
+        # operations-supported - En orden de preferencia para CUPS
         for op_id in self.SUPPORTED_OPERATIONS.keys():
             self._write_attribute(response, 0x23, 'operations-supported', op_id.to_bytes(4, 'big'))
         
@@ -1102,6 +1184,9 @@ class IPPServer:
         # printer-device-id (formato IEEE 1284)
         device_id = f'MFG:{settings.PRINTER_MAKE_MODEL.split()[0]};MDL:{settings.PRINTER_NAME};CLS:PRINTER;DES:Thermal Receipt Printer;CMD:ESC/POS;'
         self._write_attribute(response, 0x41, 'printer-device-id', device_id)
+        # device-uri (CUPS compatibility)
+        device_uri = f"usb://{settings.PRINTER_MAKE_MODEL.replace(' ', '%20')}"
+        self._write_attribute(response, 0x45, 'device-uri', device_uri)
         
         # Printer kind
         for kind in ['document', 'receipt']:
@@ -1114,6 +1199,12 @@ class IPPServer:
         # which-jobs-supported
         for which in ['completed', 'not-completed', 'all']:
             self._write_attribute(response, 0x44, 'which-jobs-supported', which)
+        
+        # job-ids-supported - Rango de IDs de trabajos
+        self._write_attribute(response, 0x22, 'job-ids-supported', (1).to_bytes(1, 'big'))
+        
+        # job-k-octets-supported - Tamaño máximo de trabajos (10MB)
+        self._write_attribute(response, 0x21, 'job-k-octets-supported', (0).to_bytes(4, 'big') + (10240).to_bytes(4, 'big'))
         
         # printer-up-time (seconds since start)
         uptime = int(time.time() - self._start_time)
@@ -1361,14 +1452,68 @@ class IPPServer:
         </html>
                 """
     
-    async def _send_http_error(self, writer: asyncio.StreamWriter, status_code: int, message: str):
+    async def _handle_options_request(self, writer: asyncio.StreamWriter, path: str, keep_alive: bool = False):
+        """Handle OPTIONS request (CUPS usa esto para discovery)"""
+        logger.info(f"🔍 Handling OPTIONS request for {path}")
+        
+        # Métodos permitidos según el path
+        if path in ['/ipp/printer', '/ipp/print', '/', '/ipp']:
+            allowed_methods = 'GET, HEAD, POST, OPTIONS'
+        else:
+            allowed_methods = 'GET, HEAD, OPTIONS'
+        
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            f"Allow: {allowed_methods}\r\n"
+            "Accept: application/ipp\r\n"
+            "Content-Type: application/ipp\r\n"
+            "Content-Length: 0\r\n"
+            "Server: CUPS/2.4 IPP/2.1\r\n"
+            f"Connection: {'Keep-Alive' if keep_alive else 'close'}\r\n"
+            + ("Keep-Alive: timeout=5, max=100\r\n" if keep_alive else "")
+            + "Date: " + datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT') + "\r\n"
+            + "\r\n"
+        )
+        
+        writer.write(response.encode())
+        await writer.drain()
+        logger.debug(f"✅ OPTIONS response sent for {path}")
+    
+    async def _handle_head_request(self, writer: asyncio.StreamWriter, path: str, keep_alive: bool = False):
+        """Handle HEAD request (como GET pero sin body)"""
+        logger.info(f"📋 Handling HEAD request for {path}")
+        
+        if path in ['/ipp/printer', '/ipp/print', '/', '/ipp']:
+            content_type = 'application/ipp'
+        else:
+            content_type = 'text/html'
+        
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            f"Content-Type: {content_type}\r\n"
+            "Server: CUPS/2.4 IPP/2.1\r\n"
+            "Accept-Ranges: none\r\n"
+            f"Connection: {'Keep-Alive' if keep_alive else 'close'}\r\n"
+            + ("Keep-Alive: timeout=5, max=100\r\n" if keep_alive else "")
+            + "Date: " + datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT') + "\r\n"
+            + "\r\n"
+        )
+        
+        writer.write(response.encode())
+        await writer.drain()
+        logger.debug(f"✅ HEAD response sent for {path}")
+    
+    async def _send_http_error(self, writer: asyncio.StreamWriter, status_code: int, message: str, keep_alive: bool = False):
         response = (
             f"HTTP/1.1 {status_code} {message}\r\n"
             "Content-Type: text/plain\r\n"
             f"Content-Length: {len(message)}\r\n"
-            "Server: ONE-POS-IPP/1.0\r\n"
-            "\r\n"
-            f"{message}"
+            "Server: CUPS/2.4 IPP/2.1\r\n"
+            f"Connection: {'Keep-Alive' if keep_alive else 'close'}\r\n"
+            + ("Keep-Alive: timeout=5, max=50\r\n" if keep_alive else "")
+            + "Date: " + datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT') + "\r\n"
+            + "\r\n"
+            + f"{message}"
         )
         
         writer.write(response.encode())
