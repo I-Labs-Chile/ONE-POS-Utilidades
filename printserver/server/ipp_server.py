@@ -356,110 +356,159 @@ class IPPServer:
             })
         
         try:
-            keep_alive = True
             # Loop para soportar múltiples requests en la misma conexión (CUPS)
-            while keep_alive:
-                timeout_duration = 3.0 if is_android else 10.0
+            request_count = 0
+            while True:
+                request_count += 1
+                logger.debug(f"[{client_ip}] Waiting for request #{request_count}")
+                
+                # Timeout adaptativo: más largo para CUPS, corto para Android
+                timeout_duration = 5.0 if is_android else 30.0
+                
                 try:
-                    request_line = await asyncio.wait_for(reader.readline(), timeout=timeout_duration)
+                    request_line = await asyncio.wait_for(
+                        reader.readline(), 
+                        timeout=timeout_duration
+                    )
                 except asyncio.TimeoutError:
-                    logger.debug(f"Connection timeout from {client_addr} after {timeout_duration}s, closing")
-                    if DEBUG_ENABLED:
-                        log_android_debug(client_ip, "Timeout waiting for request", {'client_type': client_type})
+                    logger.debug(f"[{client_ip}] Connection timeout after {timeout_duration}s (normal - closing)")
                     break
-
-                # EOF / cierre
+                
+                # EOF / cierre del cliente
                 if not request_line:
-                    logger.debug(f"EOF from {client_addr}")
+                    logger.debug(f"[{client_ip}] EOF received from client (connection closed)")
                     break
-
-                # TCP probe vacío
+                
+                # TCP probe vacío (mantener conexión)
                 if len(request_line.strip()) == 0:
-                    logger.info(f"🔍 Empty probe from {client_ip}")
-                    wait_time = 0.5 if is_android else 2.0
-                    await asyncio.sleep(wait_time)
-                    # Intentar siguiente iteración
+                    logger.debug(f"[{client_ip}] Empty probe received, continuing...")
+                    await asyncio.sleep(0.5)
                     continue
-
+                
+                # Log request line
                 raw_request_line = request_line[:100]
-                logger.debug(f"📄 Request line raw: {raw_request_line}")
+                logger.debug(f"[{client_ip}] Request line: {raw_request_line}")
+                
+                # Parse request line
                 request_line_str = request_line.decode('utf-8', errors='ignore').strip()
                 if not request_line_str:
+                    logger.warning(f"[{client_ip}] Empty request line, sending 400")
                     await self._send_http_error(writer, 400, "Bad Request", keep_alive=False)
                     break
-
+                
                 parts = request_line_str.split()
                 if len(parts) < 2:
+                    logger.warning(f"[{client_ip}] Invalid request line format, sending 400")
                     await self._send_http_error(writer, 400, "Bad Request", keep_alive=False)
                     break
-
-                method, path = parts[0], parts[1]
+                
+                method = parts[0]
+                path = parts[1]
                 version = parts[2] if len(parts) >= 3 else "HTTP/1.0"
+                
+                # Validar versión HTTP
                 if version not in ["HTTP/1.0", "HTTP/1.1"]:
-                    version = "HTTP/1.0"
-
-                # Normalizar path CUPS /printers/<queue>
+                    logger.warning(f"[{client_ip}] Unsupported HTTP version: {version}")
+                    version = "HTTP/1.1"
+                
+                # Normalizar path CUPS /printers/<queue> -> /ipp/printer
                 if path.startswith('/printers/'):
+                    original_path = path
                     path = '/ipp/printer'
-
+                    logger.debug(f"[{client_ip}] CUPS path normalized: {original_path} -> {path}")
+                
+                # Parse headers
                 headers = {}
                 content_length = 0
                 transfer_encoding = None
                 expect_continue = False
-                connection_type = 'close'
-
+                connection_type = None
+                
                 while True:
                     header_line = await reader.readline()
                     if not header_line or header_line == b'\r\n':
                         break
+                    
                     h = header_line.decode('utf-8', errors='ignore').strip()
                     if ':' in h:
                         k, v = h.split(':', 1)
-                        k_l = k.strip().lower()
-                        v_s = v.strip()
-                        headers[k_l] = v_s
-                        if k_l == 'content-length':
+                        k_lower = k.strip().lower()
+                        v_stripped = v.strip()
+                        headers[k_lower] = v_stripped
+                        
+                        # Parse specific headers
+                        if k_lower == 'content-length':
                             try:
-                                content_length = int(v_s)
+                                content_length = int(v_stripped)
                             except ValueError:
                                 content_length = 0
-                        elif k_l == 'transfer-encoding':
-                            transfer_encoding = v_s.lower()
-                        elif k_l == 'expect' and '100-continue' in v_s.lower():
+                        elif k_lower == 'transfer-encoding':
+                            transfer_encoding = v_stripped.lower()
+                        elif k_lower == 'expect' and '100-continue' in v_stripped.lower():
                             expect_continue = True
-                        elif k_l == 'connection':
-                            connection_type = v_s.lower()
-
-                keep_alive = (connection_type == 'keep-alive' and version == 'HTTP/1.1')
-
+                        elif k_lower == 'connection':
+                            connection_type = v_stripped.lower()
+                
+                # Determinar Keep-Alive según RFC 2616
+                # HTTP/1.1: Keep-Alive por defecto UNLESS Connection: close
+                # HTTP/1.0: Close por defecto UNLESS Connection: Keep-Alive
+                if version == "HTTP/1.1":
+                    keep_alive = (connection_type != 'close')
+                else:  # HTTP/1.0
+                    keep_alive = (connection_type == 'keep-alive')
+                
+                logger.debug(f"[{client_ip}] Keep-Alive: {keep_alive} (Connection: {connection_type}, Version: {version})")
+                
+                # Handle Expect: 100-continue
                 if expect_continue:
+                    logger.debug(f"[{client_ip}] Sending 100 Continue")
                     writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
                     await writer.drain()
-
-                logger.info(f"📨 {method} {path} {version} from {client_ip} keep_alive={keep_alive}")
-
-                # Routing
+                
+                # Log request
+                logger.info(f"📨 [{client_ip}] {method} {path} {version} (request #{request_count})")
+                logger.debug(f"[{client_ip}] Headers: {dict(list(headers.items())[:5])}...")  # Log first 5 headers
+                
+                # === ROUTING DE REQUESTS ===
+                
                 if method == 'OPTIONS':
                     await self._handle_options_request(writer, path, keep_alive)
+                    
                 elif method == 'HEAD':
                     await self._handle_head_request(writer, path, keep_alive)
+                    
                 elif method == 'GET' and path == '/':
-                    await self._handle_web_interface(writer)
+                    await self._handle_web_interface(writer, keep_alive)
+                    
                 elif method == 'GET' and path == '/status':
-                    await self._handle_status_request(writer)
+                    await self._handle_status_request(writer, keep_alive)
+                    
                 elif method == 'POST' and path in ['/ipp/print', '/ipp/printer', '/ipp', '/']:
-                    await self._handle_ipp_request(reader, writer, headers, client_ip, content_length, transfer_encoding, keep_alive)
+                    await self._handle_ipp_request(
+                        reader, writer, headers, client_ip, 
+                        content_length, transfer_encoding, keep_alive
+                    )
+                    
                 else:
-                    logger.warning(f"🚫 Unhandled request: {method} {path}")
+                    logger.warning(f"[{client_ip}] Unhandled request: {method} {path}")
                     await self._send_http_error(writer, 404, "Not Found", keep_alive)
-
+                
+                # Si el cliente pidió cerrar conexión, salir del loop
                 if not keep_alive:
+                    logger.debug(f"[{client_ip}] Client requested connection close, exiting loop")
                     break
-
+                
+                # Si llegamos al límite de requests por conexión (seguridad)
+                if request_count >= 100:
+                    logger.info(f"[{client_ip}] Max requests per connection reached (100), closing")
+                    break
+            
+            logger.debug(f"[{client_ip}] Connection closed after {request_count} requests")
+            
         except Exception as e:
-            logger.error(f"Error handling client {client_addr}: {e}")
+            logger.error(f"[{client_ip}] Error handling client: {e}")
             import traceback
-            logger.debug(f"Client handler error: {traceback.format_exc()}")
+            logger.debug(f"Client handler error traceback:\n{traceback.format_exc()}")
             try:
                 await self._send_http_error(writer, 500, "Internal Server Error", keep_alive=False)
             except:
@@ -482,6 +531,10 @@ class IPPServer:
         try:
             user_agent = headers.get('user-agent', 'unknown')
             logger.info(f"📱 Client: {user_agent} from {client_ip}")
+
+            # Alguien leerla esto?
+            if not self._is_android_client(client_ip):
+                self._log_cups_handshake(client_ip, "IPP Request Received", headers)
             
             # Determine how to read the body
             ipp_data = b''
@@ -1184,9 +1237,56 @@ class IPPServer:
         # printer-device-id (formato IEEE 1284)
         device_id = f'MFG:{settings.PRINTER_MAKE_MODEL.split()[0]};MDL:{settings.PRINTER_NAME};CLS:PRINTER;DES:Thermal Receipt Printer;CMD:ESC/POS;'
         self._write_attribute(response, 0x41, 'printer-device-id', device_id)
+
+        # printer type
+        self._write_attribute(response, 0x23, 'printer-type', printer_type.to_bytes(4, 'big'))
+        logger.debug(f"Added printer-type: 0x{printer_type:06x}")
+
         # device-uri (CUPS compatibility)
         device_uri = f"usb://{settings.PRINTER_MAKE_MODEL.replace(' ', '%20')}"
         self._write_attribute(response, 0x45, 'device-uri', device_uri)
+
+        # printer-type (CRÍTICO para CUPS discovery)
+        # Bits según CUPS/IPP specification:
+        # 0x0002 = CUPS_PRINTER_CLASS
+        # 0x0004 = CUPS_PRINTER_REMOTE  
+        # 0x0008 = CUPS_PRINTER_BW (monochrome)
+        # 0x0010 = CUPS_PRINTER_COLOR
+        # 0x0020 = CUPS_PRINTER_DUPLEX
+        # 0x0040 = CUPS_PRINTER_STAPLE
+        # 0x0080 = CUPS_PRINTER_COPIES
+        # 0x0100 = CUPS_PRINTER_COLLATE
+        # 0x0200 = CUPS_PRINTER_PUNCH
+        # 0x0400 = CUPS_PRINTER_COVER
+        # 0x0800 = CUPS_PRINTER_BIND
+        # 0x1000 = CUPS_PRINTER_SORT
+        # 0x2000 = CUPS_PRINTER_SMALL
+        # 0x4000 = CUPS_PRINTER_MEDIUM
+        # 0x8000 = CUPS_PRINTER_LARGE
+        # 0x10000 = CUPS_PRINTER_VARIABLE (tamaño variable)
+        # 0x20000 = CUPS_PRINTER_IMPLICIT
+        # 0x40000 = CUPS_PRINTER_DEFAULT
+        # 0x80000 = CUPS_PRINTER_FAX
+        # 0x100000 = CUPS_PRINTER_REJECTING
+        # 0x200000 = CUPS_PRINTER_DELETE
+        # 0x400000 = CUPS_PRINTER_NOT_SHARED
+        # 0x800000 = CUPS_PRINTER_AUTHENTICATED
+        # 0x1000000 = CUPS_PRINTER_COMMANDS
+        # 0x2000000 = CUPS_PRINTER_DISCOVERED
+
+        # Para impresora térmica 58mm: LOCAL + BW + SMALL + VARIABLE + NOT_SHARED + IMPLICIT
+        printer_type = (
+            0x0008 |      # BW (monochrome)
+            0x2000 |      # SMALL (58mm es pequeño)
+            0x10000 |     # VARIABLE (tamaño de papel variable)
+            0x20000 |     # IMPLICIT (impresora implícita)
+            0x400000      # NOT_SHARED (no compartida en red por defecto)
+        )
+        # Resultado: 0x432008
+
+        # tipo de impresora
+        self._write_attribute(response, 0x23, 'printer-type', printer_type.to_bytes(4, 'big'))
+        logger.debug(f"Added printer-type: 0x{printer_type:06x}")
         
         # Printer kind
         for kind in ['document', 'receipt']:
@@ -1322,7 +1422,7 @@ class IPPServer:
         
         return response.getvalue()
     
-    async def _handle_web_interface(self, writer: asyncio.StreamWriter):
+    async def _handle_web_interface(self, writer: asyncio.StreamWriter, keep_alive: bool = False):
         html_content = self._generate_web_interface()
         
         response = (
@@ -1330,14 +1430,19 @@ class IPPServer:
             "Content-Type: text/html; charset=utf-8\r\n"
             f"Content-Length: {len(html_content)}\r\n"
             "Server: ONE-POS-IPP/1.0\r\n"
-            "\r\n"
+            f"Connection: {'keep-alive' if keep_alive else 'close'}\r\n"
         )
+        
+        if keep_alive:
+            response += "Keep-Alive: timeout=30, max=100\r\n"
+        
+        response += "\r\n"
         
         writer.write(response.encode())
         writer.write(html_content.encode())
         await writer.drain()
     
-    async def _handle_status_request(self, writer: asyncio.StreamWriter):
+    async def _handle_status_request(self, writer: asyncio.StreamWriter, keep_alive: bool = False):
         status = {
             'server': {
                 'name': settings.PRINTER_NAME,
@@ -1365,8 +1470,13 @@ class IPPServer:
             "Content-Type: application/json\r\n"
             f"Content-Length: {len(json_content)}\r\n"
             "Server: ONE-POS-IPP/1.0\r\n"
-            "\r\n"
+            f"Connection: {'keep-alive' if keep_alive else 'close'}\r\n"
         )
+        
+        if keep_alive:
+            response += "Keep-Alive: timeout=30, max=100\r\n"
+        
+        response += "\r\n"
         
         writer.write(response.encode())
         writer.write(json_content.encode())
@@ -1451,9 +1561,7 @@ class IPPServer:
         </body>
         </html>
                 """
-    
     async def _handle_options_request(self, writer: asyncio.StreamWriter, path: str, keep_alive: bool = False):
-        """Handle OPTIONS request (CUPS usa esto para discovery)"""
         logger.info(f"🔍 Handling OPTIONS request for {path}")
         
         # Métodos permitidos según el path
@@ -1469,18 +1577,21 @@ class IPPServer:
             "Content-Type: application/ipp\r\n"
             "Content-Length: 0\r\n"
             "Server: CUPS/2.4 IPP/2.1\r\n"
-            f"Connection: {'Keep-Alive' if keep_alive else 'close'}\r\n"
-            + ("Keep-Alive: timeout=5, max=100\r\n" if keep_alive else "")
-            + "Date: " + datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT') + "\r\n"
-            + "\r\n"
+            f"Connection: {'keep-alive' if keep_alive else 'close'}\r\n"
         )
+        
+        # Agregar Keep-Alive header si está activo
+        if keep_alive:
+            response += "Keep-Alive: timeout=30, max=100\r\n"
+        
+        response += "Date: " + datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT') + "\r\n"
+        response += "\r\n"
         
         writer.write(response.encode())
         await writer.drain()
-        logger.debug(f"✅ OPTIONS response sent for {path}")
+        logger.debug(f"✅ OPTIONS response sent for {path} (Keep-Alive: {keep_alive})")
     
     async def _handle_head_request(self, writer: asyncio.StreamWriter, path: str, keep_alive: bool = False):
-        """Handle HEAD request (como GET pero sin body)"""
         logger.info(f"📋 Handling HEAD request for {path}")
         
         if path in ['/ipp/printer', '/ipp/print', '/', '/ipp']:
@@ -1493,31 +1604,66 @@ class IPPServer:
             f"Content-Type: {content_type}\r\n"
             "Server: CUPS/2.4 IPP/2.1\r\n"
             "Accept-Ranges: none\r\n"
-            f"Connection: {'Keep-Alive' if keep_alive else 'close'}\r\n"
-            + ("Keep-Alive: timeout=5, max=100\r\n" if keep_alive else "")
-            + "Date: " + datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT') + "\r\n"
-            + "\r\n"
+            f"Connection: {'keep-alive' if keep_alive else 'close'}\r\n"
         )
+        
+        if keep_alive:
+            response += "Keep-Alive: timeout=30, max=100\r\n"
+        
+        response += "Date: " + datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT') + "\r\n"
+        response += "\r\n"
         
         writer.write(response.encode())
         await writer.drain()
-        logger.debug(f"✅ HEAD response sent for {path}")
-    
+        logger.debug(f"✅ HEAD response sent for {path} (Keep-Alive: {keep_alive})")
+
     async def _send_http_error(self, writer: asyncio.StreamWriter, status_code: int, message: str, keep_alive: bool = False):
         response = (
             f"HTTP/1.1 {status_code} {message}\r\n"
             "Content-Type: text/plain\r\n"
             f"Content-Length: {len(message)}\r\n"
             "Server: CUPS/2.4 IPP/2.1\r\n"
-            f"Connection: {'Keep-Alive' if keep_alive else 'close'}\r\n"
-            + ("Keep-Alive: timeout=5, max=50\r\n" if keep_alive else "")
-            + "Date: " + datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT') + "\r\n"
-            + "\r\n"
-            + f"{message}"
+            f"Connection: {'keep-alive' if keep_alive else 'close'}\r\n"
         )
+        
+        if keep_alive:
+            response += "Keep-Alive: timeout=30, max=50\r\n"
+        
+        response += "Date: " + datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT') + "\r\n"
+        response += "\r\n"
+        response += f"{message}"
         
         writer.write(response.encode())
         await writer.drain()
+    
+
+    def _log_cups_handshake(self, client_ip: str, operation: str, headers: dict, message: IPPMessage = None):
+        logger.debug("=" * 60)
+        logger.debug(f"CUPS HANDSHAKE DEBUG - {operation}")
+        logger.debug("=" * 60)
+        logger.debug(f"Client IP: {client_ip}")
+        logger.debug(f"Operation: {operation}")
+        
+        logger.debug("\nHTTP Headers:")
+        for key, value in headers.items():
+            logger.debug(f"  {key}: {value}")
+        
+        if message:
+            logger.debug(f"\nIPP Message:")
+            logger.debug(f"  Version: {message.version_number}")
+            logger.debug(f"  Operation ID: 0x{message.operation_id:04x}")
+            logger.debug(f"  Request ID: {message.request_id}")
+            logger.debug(f"  Operation Attributes: {len(message.operation_attributes)}")
+            
+            if message.operation_attributes:
+                logger.debug(f"\n  Operation Attributes Detail:")
+                for attr_name, attr_value in list(message.operation_attributes.items())[:5]:
+                    logger.debug(f"    {attr_name} = {attr_value.value}")
+            
+            if message.document_data:
+                logger.debug(f"\n  Document Data: {len(message.document_data)} bytes")
+        
+        logger.debug("=" * 60)
     
     def get_connection_info(self) -> Dict[str, Any]:
         network_info = self.port_manager.get_network_info()
