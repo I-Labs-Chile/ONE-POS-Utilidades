@@ -104,6 +104,18 @@ def parse_ipp_request(data: bytes) -> IPPMessage:
         attr_count = 0
         last_attribute_name = None  # Para manejar valores múltiples según RFC 8011
         
+        def _store_attribute(target: dict, name: str, attr_value: 'AttributeValue'):
+            """Store attribute supporting multi-valued attributes (RFC 8011 5.1.4)."""
+            existing = target.get(name)
+            if existing is None:
+                target[name] = attr_value
+            else:
+                # Convert to list and append
+                if isinstance(existing, list):
+                    existing.append(attr_value)
+                else:
+                    target[name] = [existing, attr_value]
+
         while offset < len(data):
             if offset + 1 >= len(data):
                 logger.debug(f"End of data reached at offset {offset}")
@@ -183,11 +195,11 @@ def parse_ipp_request(data: bytes) -> IPPMessage:
             # Para atributos con valores múltiples, podríamos convertirlos en listas
             # Por ahora, simplemente sobrescribimos (último valor gana)
             if current_group == 'operation':
-                message.operation_attributes[name] = attr_value
+                _store_attribute(message.operation_attributes, name, attr_value)
             elif current_group == 'job':
-                message.job_attributes[name] = attr_value
+                _store_attribute(message.job_attributes, name, attr_value)
             elif current_group == 'printer':
-                message.printer_attributes[name] = attr_value
+                _store_attribute(message.printer_attributes, name, attr_value)
                 
             if attr_count <= 10:  # Log first 10 attributes for debugging
                 logger.debug(f"Parsed attribute: {name} = {attr_value.value} (tag: 0x{tag:02x})")
@@ -390,7 +402,8 @@ class IPPServer:
                         timeout=timeout_duration
                     )
                 except asyncio.TimeoutError:
-                    logger.debug(f"[{client_ip}] Connection timeout after {timeout_duration}s (normal - closing)")
+                    logger.debug(f"[{client_ip}] Connection timeout after {timeout_duration}s without request line."
+                                 f" Possible client expecting TLS (IPPS) or hostname mismatch.")
                     break
                 
                 # EOF / cierre del cliente
@@ -503,6 +516,9 @@ class IPPServer:
                     
                 elif method == 'GET' and path == '/status':
                     await self._handle_status_request(writer, keep_alive)
+                
+                elif method == 'GET' and path in ['/icon-small.png', '/icon-large.png']:
+                    await self._handle_icon_request(writer, keep_alive, path)
                     
                 elif method == 'POST' and path in ['/ipp/print', '/ipp/printer', '/ipp', '/']:
                     await self._handle_ipp_request(
@@ -528,6 +544,9 @@ class IPPServer:
             if request_count > 1:
                 logger.debug(f"[{client_ip}] Connection closed after {request_count} requests")
             
+        except ConnectionResetError as e:
+            # Cliente cerró abruptamente; tratar como cierre normal para CUPS que corta después de handshake breve
+            logger.debug(f"[{client_ip}] Connection reset by peer (normal cierre): {e}")
         except Exception as e:
             logger.error(f"[{client_ip}] Error handling client: {e}")
             import traceback
@@ -739,11 +758,16 @@ class IPPServer:
             logger.debug(f"Request ID: {message.request_id}, Version: {message.version_number}")
             if message.operation_attributes:
                 logger.debug(f"Operation attributes: {len(message.operation_attributes)} items")
-                # CORRECCIÓN: Iterar sobre el diccionario correctamente
-                for i, (attr_name, attr_value) in enumerate(message.operation_attributes.items()):
-                    if i >= 5:  # Solo mostrar los primeros 5
+                shown = 0
+                for attr_name, attr_value in message.operation_attributes.items():
+                    if shown >= 8:  # mostrar algunos más ahora que soportamos multi-valor
                         break
-                    logger.debug(f"  Attribute: {attr_name}={attr_value.value}")
+                    if isinstance(attr_value, list):
+                        values = [v.value for v in attr_value]
+                        logger.debug(f"  Attribute: {attr_name}={values}")
+                    else:
+                        logger.debug(f"  Attribute: {attr_name}={attr_value.value}")
+                    shown += 1
             
             if message.job_attributes:
                 logger.debug(f"Job attributes: {len(message.job_attributes)} items")
@@ -1074,20 +1098,34 @@ class IPPServer:
     def _get_requested_attributes(self, message: IPPMessage) -> list:
         """Extrae la lista de atributos solicitados del mensaje IPP"""
         if 'requested-attributes' not in message.operation_attributes:
-            return []  # Vacío significa "todos"
-        
-        # En IPP, requested-attributes puede tener múltiples valores
-        # pero nuestro parser solo guarda el último valor
-        # Por ahora, aceptamos que solo tengamos uno
-        attr = message.operation_attributes['requested-attributes']
-        value = attr.value
-        
-        if isinstance(value, bytes):
-            return [value.decode('utf-8', errors='ignore')]
-        elif isinstance(value, str):
-            return [value]
+            return []  # Vacío => enviar todo
+
+        attr_obj = message.operation_attributes['requested-attributes']
+
+        values: List[str] = []
+        if isinstance(attr_obj, list):
+            for a in attr_obj:
+                val = a.value
+                if isinstance(val, bytes):
+                    values.append(val.decode('utf-8', errors='ignore'))
+                else:
+                    values.append(str(val))
         else:
-            return []
+            val = attr_obj.value
+            if isinstance(val, bytes):
+                values.append(val.decode('utf-8', errors='ignore'))
+            else:
+                values.append(str(val))
+
+        # Normalizar y eliminar vacíos/duplicados conservando orden
+        cleaned = []
+        seen = set()
+        for v in values:
+            v_strip = v.strip()
+            if v_strip and v_strip not in seen:
+                cleaned.append(v_strip)
+                seen.add(v_strip)
+        return cleaned
     
     async def _handle_get_printer_attributes(self, message: IPPMessage) -> bytes:
         response = io.BytesIO()
@@ -1180,6 +1218,39 @@ class IPPServer:
                 elif attr_name == 'operations-supported':
                     for op_id in self.SUPPORTED_OPERATIONS.keys():
                         self._write_attribute(response, 0x23, 'operations-supported', op_id.to_bytes(4, 'big'))
+
+                elif attr_name == 'compression-supported':
+                    for comp in ['none', 'gzip', 'deflate']:
+                        self._write_attribute(response, 0x44, 'compression-supported', comp)
+
+                elif attr_name == 'copies-supported':
+                    # rangeOfInteger: min,max (dos enteros consecutivos)
+                    self._write_attribute(response, 0x21, 'copies-supported', (1).to_bytes(4, 'big') + (99).to_bytes(4, 'big'))
+
+                elif attr_name == 'print-color-mode-supported':
+                    self._write_attribute(response, 0x44, 'print-color-mode-supported', 'monochrome')
+
+                elif attr_name == 'media-col-supported':
+                    for attr in ['media-size', 'media-type', 'media-source']:
+                        self._write_attribute(response, 0x44, 'media-col-supported', attr)
+
+                elif attr_name == 'multiple-document-handling-supported':
+                    self._write_attribute(response, 0x44, 'multiple-document-handling-supported', 'separate-documents-uncollated-copies')
+
+                elif attr_name == 'printer-alert':
+                    self._write_attribute(response, 0x44, 'printer-alert', 'none')
+
+                elif attr_name == 'printer-alert-description':
+                    self._write_attribute(response, 0x41, 'printer-alert-description', 'none')
+
+                elif attr_name == 'printer-mandatory-job-attributes':
+                    self._write_attribute(response, 0x44, 'printer-mandatory-job-attributes', 'none')
+
+                elif attr_name == 'printer-state-message':
+                    self._write_attribute(response, 0x41, 'printer-state-message', 'ready')
+
+                elif attr_name == 'cups-version':
+                    self._write_attribute(response, 0x41, 'cups-version', '2.4')
                 
                 elif attr_name == 'document-format-supported':
                     formats = ['application/octet-stream', 'image/pwg-raster', 'application/vnd.cups-raster',
@@ -1265,6 +1336,11 @@ class IPPServer:
                     self._write_attribute(response, 0x44, 'output-bin-supported', 'face-down')
                     self._write_attribute(response, 0x44, 'output-bin-default', 'face-down')
                 
+                elif attr_name == 'printer-icons':
+                    # Enviar URIs de íconos simples (aunque sean placeholders)
+                    icon_base = f"http://{local_ip}:{self.port}"
+                    self._write_attribute(response, 0x45, 'printer-icons', f"{icon_base}/icon-small.png")
+                    self._write_attribute(response, 0x45, 'printer-icons', f"{icon_base}/icon-large.png")
                 else:
                     logger.debug(f"⚠️ Requested attribute '{attr_name}' not implemented")
             
@@ -1376,6 +1452,13 @@ class IPPServer:
         self._write_attribute(response, 0x44, 'media-default', 'oe_roll_58mm')
         self._write_attribute(response, 0x44, 'media-ready', 'oe_roll_58mm')
         
+        # media-col-database (CUPS consulta esto para media details)
+        # Nota: IPP define media-col como una collection; aquí devolvemos nombres disponibles como texto simple
+        for media in media_names:
+            self._write_attribute(response, 0x44, 'media-col-database', media)
+        # También incluir un entry genérico con tamaño en mm (aprox 58mm x variable)
+        self._write_attribute(response, 0x44, 'media-col-database', 'media-size:58xvariable;media-type:continuous;media-source:main')
+
         # media-col-supported (atributos de media collection)
         media_col_attrs = ['media-size', 'media-type', 'media-source']
         for attr in media_col_attrs:
@@ -1725,6 +1808,31 @@ class IPPServer:
         writer.write(response.encode())
         writer.write(json_content.encode())
         await writer.drain()
+
+    async def _handle_icon_request(self, writer: asyncio.StreamWriter, keep_alive: bool, path: str):
+        """Devuelve un PNG mínimo para atributos printer-icons solicitados por CUPS/AirPrint."""
+        # PNG 1x1 transparente (chunk válido) generado previamente
+        # Hex: 89504E470D0A1A0A 0000000D49484452 00000001 00000001 0806000000 1F15C489
+        #      0000000A49444154 789C6360000002000154 0B0DBD 0000000049454E44AE426082
+        png_hex = (
+            "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+            "0000000a49444154789c63600000020001540b0dbd0000000049454e44ae426082"
+        )
+        data = bytes.fromhex(png_hex)
+        headers = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: image/png\r\n"
+            f"Content-Length: {len(data)}\r\n"
+            "Cache-Control: max-age=3600\r\n"
+            f"Connection: {'keep-alive' if keep_alive else 'close'}\r\n"
+        )
+        if keep_alive:
+            headers += "Keep-Alive: timeout=30, max=100\r\n"
+        headers += "\r\n"
+        writer.write(headers.encode())
+        writer.write(data)
+        await writer.drain()
+        logger.debug(f"✅ Icon {path} servido ({len(data)} bytes)")
     
     def _generate_web_interface(self) -> str:
         network_info = self.port_manager.get_network_info()

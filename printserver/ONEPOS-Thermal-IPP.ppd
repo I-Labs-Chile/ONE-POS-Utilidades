@@ -1,0 +1,53 @@
+*PPD-Adobe: "4.3"
+*% One POS Thermal IPP passthrough PPD
+*FormatVersion: "4.3"
+*FileVersion: "1.0"
+*LanguageVersion: English
+*LanguageEncoding: ISOLatin1
+*PCFileName: "ONEPOSIPP.PPD"
+*Manufacturer: "ONE-POS"
+*ModelName: "ONE-POS Thermal IPP"
+*NickName: "ONE-POS Thermal 58mm (IPP, PDF/JPEG/PNG passthrough)"
+*ShortNickName: "ONEPOS Thermal IPP"
+*Product: "(ESC/POS)"
+*cupsVersion: 2.4
+*cupsModelNumber: 58
+*cupsManualCopies: True
+*cupsSNMPSupplies: False
+*ColorDevice: False
+*DefaultColorSpace: Gray
+
+*% Pass-through filters so client sends source data; server converts to ESC/POS
+*cupsFilter: "application/pdf 0 -"
+*cupsFilter: "image/jpeg 0 -"
+*cupsFilter: "image/png 0 -"
+*cupsFilter: "image/pwg-raster 0 -"
+*cupsFilter: "text/plain 0 -"
+
+*% Resolution (203 DPI typical for 58mm thermal)
+*OpenUI *Resolution/Resolution: PickOne
+*DefaultResolution: 203dpi
+*Resolution 203dpi/203 DPI: "<</HWResolution[203 203]>>setpagedevice"
+*CloseUI: *Resolution
+
+*OpenUI *MediaType/Media Type: PickOne
+*DefaultMediaType: Continuous
+*MediaType Continuous/Continuous Roll: ""
+*CloseUI: *MediaType
+
+*% Define a reasonable default page size for receipts (58mm wide x 200mm tall)
+*OpenUI *PageSize/Page Size: PickOne
+*DefaultPageSize: Roll-58x200mm
+*PageSize Roll-58x200mm/58mm x 200mm: "<</PageSize[164 566]>>setpagedevice"
+*CloseUI: *PageSize
+
+*ImageableArea Roll-58x200mm: "0 0 164 566"
+*PaperDimension Roll-58x200mm: "164 566"
+
+*% Margins
+*HWMargins: "0 0 0 0"
+
+*% Duplex not supported
+*Duplex: None
+
+*% UI Constraints (none)

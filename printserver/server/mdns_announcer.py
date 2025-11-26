@@ -60,10 +60,17 @@ class MDNSAnnouncer:
         try:
             self.zeroconf = AsyncZeroconf()
             
-            # Register all services
+            # Register all services (orden: IPP básico, Printer, PDL, AirPrint)
             await self._register_ipp_service()
-            await self._register_printer_service()
-            await self._register_pdl_service()
+            # Servicios adicionales para compatibilidad con CUPS/AirPrint si están disponibles
+            try:
+                await self._register_printer_service()
+            except Exception as e:
+                logger.debug(f"Optional _printer service not registered: {e}")
+            try:
+                await self._register_pdl_service()
+            except Exception as e:
+                logger.debug(f"Optional PDL service not registered: {e}")
             await self._register_airprint_service()
             
             self.is_running = True
@@ -166,6 +173,59 @@ class MDNSAnnouncer:
         self.services["ipp"] = service_info
         
         logger.info(f"Registered IPP service: {service_name} at {local_ip}:{self.server_port}")
+
+    async def _register_printer_service(self):
+        """Registrar servicio _printer._tcp (compatibilidad histórica con CUPS)."""
+        service_name = f"{settings.MDNS_SERVICE_NAME}._printer._tcp.local."
+
+        local_ip = self.server_host
+        if local_ip == '0.0.0.0':
+            local_ip = self._get_local_ip()
+
+        txt_record = {
+            'ty': settings.PRINTER_MAKE_MODEL,
+            'note': settings.PRINTER_INFO,
+            'product': f'({settings.PRINTER_MAKE_MODEL})',
+        }
+
+        service_info = ServiceInfo(
+            "_printer._tcp.local.",
+            service_name,
+            addresses=[socket.inet_aton(local_ip)],
+            port=self.server_port,
+            properties=txt_record,
+            server=f"{socket.gethostname()}.local."
+        )
+
+        await self.zeroconf.async_register_service(service_info)
+        self.services["printer"] = service_info
+        logger.info(f"Registered Printer service: {service_name} at {local_ip}:{self.server_port}")
+
+    async def _register_pdl_service(self):
+        """Registrar servicio de PDL genérico para clientes que lo consultan."""
+        service_name = f"{settings.MDNS_SERVICE_NAME} PDL._pdl-datastream._tcp.local."
+
+        local_ip = self.server_host
+        if local_ip == '0.0.0.0':
+            local_ip = self._get_local_ip()
+
+        txt_record = {
+            'pdl': 'application/octet-stream,image/pwg-raster,application/pdf,image/jpeg,image/png',
+            'Binary': 'T',
+        }
+
+        service_info = ServiceInfo(
+            "_pdl-datastream._tcp.local.",
+            service_name,
+            addresses=[socket.inet_aton(local_ip)],
+            port=self.server_port,
+            properties=txt_record,
+            server=f"{socket.gethostname()}.local."
+        )
+
+        await self.zeroconf.async_register_service(service_info)
+        self.services["pdl"] = service_info
+        logger.info(f"Registered PDL service: {service_name} at {local_ip}:{self.server_port}")
     
     async def _register_airprint_service(self):
         # AirPrint uses the same _ipp._tcp service but with specific TXT records
