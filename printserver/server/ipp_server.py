@@ -262,7 +262,122 @@ class IPPServer:
         # Server state
         self.is_running = False
         self.start_time = None
+
+        # Solo AGREGAR estas líneas al final del __init__ existente:
+        self.connection_stats = {
+            'total_connections': 0,
+            'probe_connections': 0,
+            'valid_connections': 0,
+            'cups_connections': 0,
+            'android_connections': 0
+}
     
+    def _is_cups_probe_connection(self, client_ip: str, had_data: bool, request_count: int) -> bool:
+        """
+        Detecta si una conexión es un CUPS probe que debe ignorarse en logs.
+        
+        CUPS hace múltiples conexiones simultáneas para discovery:
+        - Algunas nunca envían datos (pure probes)
+        - Otras envían OPTIONS/HEAD y cierran inmediatamente
+        
+        Args:
+            client_ip: IP del cliente
+            had_data: Si la conexión recibió algún dato
+            request_count: Número de requests procesadas
+            
+        Returns:
+            True si es una conexión probe que debe ignorarse
+        """
+        # Localhost sin datos = probe
+        if client_ip == '127.0.0.1' and not had_data:
+            return True
+        
+        # Localhost con solo 1 request corto = probe
+        if client_ip == '127.0.0.1' and request_count == 1:
+            return True
+        
+        # Red local con timeout inmediato = probe
+        if client_ip.startswith('10.') and not had_data:
+            return True
+        
+        return False
+    
+    def _get_adaptive_timeout(self, request_count: int, is_android: bool) -> float:
+        """
+        Calcula timeout adaptativo basado en tipo de cliente y número de request.
+        
+        CUPS hace probes rápidos, Android necesita más tiempo para renderizar.
+        
+        Args:
+            request_count: Número de request actual
+            is_android: Si el cliente es Android
+            
+        Returns:
+            Timeout en segundos
+        """
+        if request_count == 1:
+            # Primera request: timeout corto para detectar probes
+            return 2.0
+        
+        # Requests subsecuentes: más tiempo según cliente
+        return 5.0 if is_android else 10.0
+    
+    def _should_log_connection(self, client_ip: str, method: str = None, 
+                              request_count: int = 0, had_data: bool = False) -> bool:
+        """
+        Determina si una conexión/request debe loguearse para evitar spam.
+        
+        Args:
+            client_ip: IP del cliente
+            method: Método HTTP (GET, POST, etc.)
+            request_count: Número de request
+            had_data: Si hubo datos en la conexión
+            
+        Returns:
+            True si debe loguearse
+        """
+        # Siempre loguear POST (requests reales)
+        if method == 'POST':
+            return True
+        
+        # Siempre loguear primera request con datos
+        if request_count == 1 and had_data:
+            return True
+        
+        # Loguear GET importantes
+        if method == 'GET' and request_count <= 2:
+            return True
+        
+        # No loguear probes de CUPS
+        if self._is_cups_probe_connection(client_ip, had_data, request_count):
+            return False
+        
+        # No loguear OPTIONS/HEAD repetitivos de localhost
+        if client_ip == '127.0.0.1' and method in ['OPTIONS', 'HEAD'] and request_count > 1:
+            return False
+        
+        return True
+    
+    def _get_max_requests_per_connection(self, client_type: str) -> int:
+        """
+        Determina el máximo de requests permitidas por conexión según tipo de cliente.
+        
+        CUPS raramente usa más de 5-10 requests.
+        Android puede hacer muchas más.
+        
+        Args:
+            client_type: 'cups/linux' o 'android'
+            
+        Returns:
+            Número máximo de requests
+        """
+        if client_type == "cups/linux":
+            return 10
+        elif client_type == "android":
+            return 100
+        else:
+            return 50  # Default conservador
+
     def _is_android_client(self, client_ip: str) -> bool:
         """Check if client is in Android/mobile IP patterns for enhanced debugging"""
         android_ip_patterns = [
@@ -379,6 +494,12 @@ class IPPServer:
         is_android = self._is_android_client(client_ip)
         client_type = "android" if is_android else "cups/linux"
         
+        # ===== FIX 1: Timeout adaptativo más agresivo =====
+        # CUPS hace muchas conexiones probe que cierran inmediatamente
+        # Reducir timeout inicial para detectar estas conexiones rápido
+        initial_timeout = 2.0  # 2 segundos en lugar de 30
+        request_timeout = 5.0 if is_android else 10.0  # Timeout para requests subsecuentes
+        
         # Initialize debugging session
         if DEBUG_ENABLED:
             log_android_debug(client_ip, f"New connection from {client_type}", {
@@ -389,12 +510,22 @@ class IPPServer:
         try:
             # Loop para soportar múltiples requests en la misma conexión (CUPS)
             request_count = 0
+            connection_had_data = False  # Track if we ever received real data
+            
             while True:
                 request_count += 1
-                logger.debug(f"[{client_ip}] Waiting for request #{request_count}")
                 
-                # Timeout adaptativo: más largo para CUPS, corto para Android
-                timeout_duration = 5.0 if is_android else 30.0
+                # ===== FIX 2: Timeout diferenciado para primera request =====
+                # Primera request: timeout corto para detectar probes
+                # Requests subsecuentes: timeout normal
+                if request_count == 1:
+                    timeout_duration = initial_timeout
+                else:
+                    timeout_duration = request_timeout
+                
+                # Solo logear primera request para evitar spam
+                if request_count == 1 or connection_had_data:
+                    logger.debug(f"[{client_ip}] Waiting for request #{request_count} (timeout: {timeout_duration}s)")
                 
                 try:
                     request_line = await asyncio.wait_for(
@@ -402,16 +533,24 @@ class IPPServer:
                         timeout=timeout_duration
                     )
                 except asyncio.TimeoutError:
-                    logger.debug(f"[{client_ip}] Connection timeout after {timeout_duration}s without request line."
-                                 f" Possible client expecting TLS (IPPS) or hostname mismatch.")
+                    # ===== FIX 3: Manejo silencioso de probe connections =====
+                    # CUPS hace muchas conexiones probe que nunca envían datos
+                    # Solo logear si la conexión tuvo actividad previa
+                    if connection_had_data:
+                        logger.debug(f"[{client_ip}] Connection timeout after {timeout_duration}s without request line.")
+                    # No logear nada para probes vacíos (reduce spam)
                     break
                 
                 # EOF / cierre del cliente
                 if not request_line:
-                    # Solo loguear si no es la primera request (para evitar spam de port scanning)
-                    if request_count > 1:
+                    # ===== FIX 4: Logging condicional de EOF =====
+                    # Solo loguear EOF si hubo requests válidas anteriormente
+                    if connection_had_data:
                         logger.debug(f"[{client_ip}] EOF received from client (connection closed)")
                     break
+                
+                # Marcar que esta conexión tuvo datos
+                connection_had_data = True
                 
                 # TCP probe vacío (mantener conexión)
                 if len(request_line.strip()) == 0:
@@ -419,7 +558,7 @@ class IPPServer:
                     await asyncio.sleep(0.5)
                     continue
                 
-                # Log request line
+                # Log request line (solo si hay datos reales)
                 raw_request_line = request_line[:100]
                 logger.debug(f"[{client_ip}] Request line: {raw_request_line}")
                 
@@ -483,11 +622,15 @@ class IPPServer:
                         elif k_lower == 'connection':
                             connection_type = v_stripped.lower()
                 
-                # Determinar Keep-Alive según RFC 2616
-                # HTTP/1.1: Keep-Alive por defecto UNLESS Connection: close
-                # HTTP/1.0: Close por defecto UNLESS Connection: Keep-Alive
+                # ===== FIX 5: Keep-Alive más conservador para CUPS =====
+                # CUPS a veces envía Connection: close pero espera keep-alive
+                # Ser más permisivo con HTTP/1.1
                 if version == "HTTP/1.1":
+                    # HTTP/1.1: Keep-Alive por defecto UNLESS explícitamente close
                     keep_alive = (connection_type != 'close')
+                    # Pero si es CUPS local, siempre cerrar después de OPTIONS/HEAD
+                    if client_ip == '127.0.0.1' and method in ['OPTIONS', 'HEAD']:
+                        keep_alive = False
                 else:  # HTTP/1.0
                     keep_alive = (connection_type == 'keep-alive')
                 
@@ -499,9 +642,12 @@ class IPPServer:
                     writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
                     await writer.drain()
                 
-                # Log request
+                # Log request (solo requests con datos reales)
                 logger.info(f"📨 [{client_ip}] {method} {path} {version} (request #{request_count})")
-                logger.debug(f"[{client_ip}] Headers: {dict(list(headers.items())[:5])}...")  # Log first 5 headers
+                
+                # Logging condicional de headers (solo primeras 5)
+                if request_count <= 3 or content_length > 0:
+                    logger.debug(f"[{client_ip}] Headers: {dict(list(headers.items())[:5])}...")
                 
                 # === ROUTING DE REQUESTS ===
                 
@@ -535,22 +681,31 @@ class IPPServer:
                     logger.debug(f"[{client_ip}] Client requested connection close, exiting loop")
                     break
                 
-                # Si llegamos al límite de requests por conexión (seguridad)
-                if request_count >= 100:
-                    logger.info(f"[{client_ip}] Max requests per connection reached (100), closing")
+                # ===== FIX 6: Límite de requests más conservador para CUPS =====
+                # CUPS raramente usa más de 5-10 requests por conexión
+                max_requests = 10 if client_type == "cups/linux" else 100
+                if request_count >= max_requests:
+                    logger.info(f"[{client_ip}] Max requests per connection reached ({max_requests}), closing")
                     break
             
-            # Solo loguear si hubo al menos una request válida
-            if request_count > 1:
+            # ===== FIX 7: Logging resumido de cierre de conexión =====
+            # Solo loguear si hubo requests válidas
+            if connection_had_data and request_count > 1:
                 logger.debug(f"[{client_ip}] Connection closed after {request_count} requests")
             
         except ConnectionResetError as e:
-            # Cliente cerró abruptamente; tratar como cierre normal para CUPS que corta después de handshake breve
-            logger.debug(f"[{client_ip}] Connection reset by peer (normal cierre): {e}")
+            # Cliente cerró abruptamente; esto es normal para CUPS probes
+            if connection_had_data:
+                logger.debug(f"[{client_ip}] Connection reset by peer: {e}")
+            # No logear nada para probes que nunca enviaron datos
+            
         except Exception as e:
-            logger.error(f"[{client_ip}] Error handling client: {e}")
-            import traceback
-            logger.debug(f"Client handler error traceback:\n{traceback.format_exc()}")
+            # Solo logear excepciones de conexiones que tuvieron datos
+            if connection_had_data:
+                logger.error(f"[{client_ip}] Error handling client: {e}")
+                import traceback
+                logger.debug(f"Client handler error traceback:\n{traceback.format_exc()}")
+            
             try:
                 await self._send_http_error(writer, 500, "Internal Server Error", keep_alive=False)
             except:
@@ -563,188 +718,170 @@ class IPPServer:
                 pass
 
     async def _handle_ipp_request(self, reader: asyncio.StreamReader, 
-                                writer: asyncio.StreamWriter, headers: dict, 
-                                client_ip: str = None, content_length: int = 0,
-                                transfer_encoding: str = None, keep_alive: bool = False):
+                            writer: asyncio.StreamWriter, headers: dict, 
+                            client_ip: str = None, content_length: int = 0,
+                            transfer_encoding: str = None, keep_alive: bool = False):
+        """
+        REEMPLAZAR el método _handle_ipp_request con esta versión optimizada
+        """
         client_addr = writer.get_extra_info('peername')
         if not client_ip:
             client_ip = client_addr[0] if client_addr else "unknown"
         
         try:
             user_agent = headers.get('user-agent', 'unknown')
-            logger.info(f"📱 Client: {user_agent} from {client_ip}")
-
-            # Alguien leerla esto?
-            if not self._is_android_client(client_ip):
+            
+            # Logging condicional: solo para debug detallado
+            is_cups = 'CUPS' in user_agent
+            should_log_detail = not is_cups or content_length > 0
+            
+            if should_log_detail:
+                logger.info(f"📱 Client: {user_agent} from {client_ip}")
+            
+            # CUPS handshake logging (solo si no es Android)
+            if not self._is_android_client(client_ip) and should_log_detail:
                 self._log_cups_handshake(client_ip, "IPP Request Received", headers)
             
-            # Determine how to read the body
+            # Read body data
             ipp_data = b''
             
             if transfer_encoding == 'chunked':
-                # Read chunked data
-                logger.debug(f"📦 Reading chunked data from {client_ip}")
+                # Chunked transfer
                 chunks = []
                 total_size = 0
                 
                 while True:
-                    # Read chunk size line
                     chunk_size_line = await reader.readline()
                     if not chunk_size_line:
                         break
                     
-                    # Parse chunk size (hex)
                     try:
                         chunk_size = int(chunk_size_line.strip(), 16)
                     except ValueError:
-                        logger.error(f"Invalid chunk size: {chunk_size_line}")
+                        logger.error(f"[{client_ip}] Invalid chunk size")
                         break
                     
                     if chunk_size == 0:
-                        # Last chunk, read trailing headers if any
                         await reader.readline()  # Read final CRLF
                         break
                     
-                    # Read chunk data
                     chunk_data = await reader.readexactly(chunk_size)
                     chunks.append(chunk_data)
                     total_size += chunk_size
-                    
-                    # Read trailing CRLF after chunk
-                    await reader.readline()
-                    
-                    logger.debug(f"📦 Read chunk: {chunk_size} bytes (total: {total_size})")
+                    await reader.readline()  # Read trailing CRLF
                 
                 ipp_data = b''.join(chunks)
-                actual_length = len(ipp_data)
-                logger.info(f"✅ Chunked transfer complete: {actual_length} bytes")
-                
+                if should_log_detail:
+                    logger.info(f"✅ Chunked transfer: {len(ipp_data)} bytes")
+                    
             elif content_length > 0:
-                # Read with Content-Length
-                logger.debug(f"📄 Reading {content_length} bytes from {client_ip}")
-                ipp_data = await reader.read(content_length)
-                actual_length = len(ipp_data)
-                logger.debug(f"Read {actual_length}/{content_length} bytes")
-                
-            else:
-                # Try to read whatever is available (fallback)
-                logger.warning(f"⚠️ No Content-Length or Transfer-Encoding, reading available data")
-                # Set a reasonable timeout for reading
+                # Fixed Content-Length
                 try:
-                    ipp_data = await asyncio.wait_for(reader.read(10 * 1024 * 1024), timeout=5.0)
-                    actual_length = len(ipp_data)
-                    logger.info(f"📄 Read {actual_length} bytes without explicit length")
+                    ipp_data = await asyncio.wait_for(
+                        reader.read(content_length),
+                        timeout=30.0  # Timeout para lecturas grandes
+                    )
                 except asyncio.TimeoutError:
-                    logger.error("❌ Timeout reading request data")
-                    await self._send_http_error(writer, 408, "Request Timeout")
+                    logger.error(f"[{client_ip}] Timeout reading {content_length} bytes")
+                    await self._send_http_error(writer, 408, "Request Timeout", keep_alive=False)
+                    return
+            else:
+                # No explicit length - try to read with timeout
+                try:
+                    ipp_data = await asyncio.wait_for(
+                        reader.read(10 * 1024 * 1024),  # Max 10MB
+                        timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"[{client_ip}] No data received (timeout)")
+                    await self._send_http_error(writer, 400, "No content", keep_alive=False)
                     return
             
-            # Validate we have data
+            # Validate data
             if not ipp_data or len(ipp_data) == 0:
-                logger.warning(f"⚠️ No data received from {client_addr}")
-                if DEBUG_ENABLED and self._is_android_client(client_ip):
-                    log_android_debug(client_ip, "ERROR: No IPP data received", {
-                        'headers': dict(headers),
-                        'content_length': content_length,
-                        'transfer_encoding': transfer_encoding
-                    })
-                await self._send_http_error(writer, 400, "No content")
+                logger.warning(f"[{client_ip}] No IPP data received")
+                await self._send_http_error(writer, 400, "No content", keep_alive=False)
                 return
             
             actual_length = len(ipp_data)
-            logger.info(f"✅ Received {actual_length} bytes of IPP data from {client_ip}")
             
-            # Save request data for analysis
-            if DEBUG_ENABLED and self._is_android_client(client_ip):
+            # Logging condicional del tamaño
+            if should_log_detail:
+                logger.info(f"✅ Received {actual_length} bytes from {client_ip}")
+            
+            # Save for debugging (solo Android o errores)
+            if DEBUG_ENABLED and (self._is_android_client(client_ip) or actual_length < 100):
                 save_request_data(client_ip, ipp_data, headers, "/ipp/printer")
-                log_android_debug(client_ip, f"IPP data received: {actual_length} bytes", {
-                    'expected': content_length if content_length > 0 else 'chunked',
-                    'received': actual_length,
-                    'data_preview': ipp_data[:100].hex() if len(ipp_data) > 0 else 'empty',
-                    'transfer_encoding': transfer_encoding
-                })
             
-            # Validate IPP data has minimum header
+            # Validate minimum IPP header
             if actual_length < 8:
-                logger.error(f"❌ IPP data too short from {client_addr}: {actual_length} bytes")
-                await self._send_http_error(writer, 400, "Invalid IPP data")
+                logger.error(f"[{client_ip}] IPP data too short: {actual_length} bytes")
+                await self._send_http_error(writer, 400, "Invalid IPP data", keep_alive=False)
                 return
             
             # Parse IPP message
-            logger.debug(f"Parsing IPP message from {client_addr}")
             message = parse_ipp_request(ipp_data)
             
-            if DEBUG_ENABLED and self._is_android_client(client_ip):
-                log_android_debug(client_ip, "IPP message parsed", {
-                    'operation_id': f"0x{message.operation_id:04x}" if message.operation_id else "None",
-                    'request_id': message.request_id,
-                    'version': message.version_number,
-                    'operation_attributes': len(message.operation_attributes),
-                    'document_data_size': len(message.document_data) if message.document_data else 0
-                })
-            
             if message.operation_id is None:
-                logger.error(f"❌ Failed to parse IPP operation from {client_addr}")
-                if DEBUG_ENABLED and self._is_android_client(client_ip):
-                    log_android_debug(client_ip, "ERROR: Failed to parse IPP operation")
-                await self._send_http_error(writer, 400, "Invalid IPP message")
+                logger.error(f"[{client_ip}] Failed to parse IPP operation")
+                await self._send_http_error(writer, 400, "Invalid IPP message", keep_alive=False)
                 return
             
-            # Log operation details
-            operation_name = self.SUPPORTED_OPERATIONS.get(message.operation_id, f'Unknown-0x{message.operation_id:04x}')
-            logger.info(f"🔧 Processing: {operation_name} from {client_ip}")
+            # Log operation
+            operation_name = self.SUPPORTED_OPERATIONS.get(
+                message.operation_id, 
+                f'Unknown-0x{message.operation_id:04x}'
+            )
             
-            # Handle operation
-            logger.debug(f"Processing IPP operation from {client_addr}")
+            # Solo loguear operaciones importantes
+            if message.operation_id != 0x000b or should_log_detail:  # 0x000b = Get-Printer-Attributes
+                logger.info(f"🔧 {operation_name} from {client_ip}")
+            
+            # Process operation
             response_data = await self._process_ipp_operation(message, client_ip)
             
             if not response_data:
-                logger.error(f"❌ No response data generated for {client_addr}")
-                await self._send_http_error(writer, 500, "Failed to process operation")
+                logger.error(f"[{client_ip}] No response generated")
+                await self._send_http_error(writer, 500, "Processing failed", keep_alive=False)
                 return
             
-            # Send HTTP response - Compatible con CUPS
-            # Determinar versión IPP para el header basado en el mensaje
-            ipp_version = f"{message.version_number[0]}.{message.version_number[1]}" if hasattr(message, 'version_number') else "2.0"
+            # Send response
+            ipp_version = f"{message.version_number[0]}.{message.version_number[1]}"
             
             response_headers = (
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: application/ipp\r\n"
                 f"Content-Length: {len(response_data)}\r\n"
-                f"Server: IPP/{ipp_version}\r\n"  # Usar versión que respondimos en IPP
+                f"Server: IPP/{ipp_version}\r\n"
                 "Content-Language: en\r\n"
                 "Date: " + datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT') + "\r\n"
                 f"Connection: {'keep-alive' if keep_alive else 'close'}\r\n"
-                + ("Keep-Alive: timeout=30, max=100\r\n" if keep_alive else "")
-                + "\r\n"
             )
             
-            logger.debug(f"Sending {len(response_data)} bytes response to {client_addr}")
-            logger.debug(f"HTTP Response headers:\n{response_headers[:200]}...")  # Log headers
+            if keep_alive:
+                response_headers += "Keep-Alive: timeout=30, max=100\r\n"
+            
+            response_headers += "\r\n"
             
             try:
                 writer.write(response_headers.encode())
                 writer.write(response_data)
                 await writer.drain()
                 
-                logger.info(f"✅ Response sent successfully to {client_ip}: {len(response_data)} bytes")
-                logger.debug(f"   HTTP headers size: {len(response_headers)} bytes")
-                logger.debug(f"   IPP body size: {len(response_data)} bytes")
-                logger.debug(f"   Total sent: {len(response_headers) + len(response_data)} bytes")
-            except ConnectionResetError as conn_err:
-                logger.warning(f"⚠️  Client {client_ip} closed connection while sending response: {conn_err}")
-                # No es un error fatal - el cliente simplemente cerró
-                return
-            except BrokenPipeError as pipe_err:
-                logger.warning(f"⚠️  Broken pipe to {client_ip}: {pipe_err}")
+                # Logging condicional de éxito
+                if should_log_detail or len(response_data) > 5000:
+                    logger.info(f"✅ Response sent to {client_ip}: {len(response_data)} bytes")
+                
+            except (ConnectionResetError, BrokenPipeError) as e:
+                logger.debug(f"[{client_ip}] Connection closed during send: {e}")
                 return
             
         except Exception as e:
-            logger.error(f"❌ Error processing IPP request from {client_addr}: {e}")
+            logger.error(f"[{client_ip}] IPP request error: {e}")
             import traceback
-            logger.debug(f"IPP error traceback: {traceback.format_exc()}")
+            logger.debug(traceback.format_exc())
             try:
-                await self._send_http_error(writer, 500, "IPP Processing Error")
+                await self._send_http_error(writer, 500, "IPP Error", keep_alive=False)
             except:
                 pass
     
@@ -1101,8 +1238,8 @@ class IPPServer:
             return []  # Vacío => enviar todo
 
         attr_obj = message.operation_attributes['requested-attributes']
+        values = []
 
-        values: List[str] = []
         if isinstance(attr_obj, list):
             for a in attr_obj:
                 val = a.value
@@ -1127,11 +1264,33 @@ class IPPServer:
                 seen.add(v_strip)
         return cleaned
     
+    def get_connection_statistics(self) -> Dict[str, Any]:
+        """
+        AGREGAR este método nuevo para debugging
+        
+        Retorna estadísticas de conexiones para diagnosticar problemas.
+        """
+        return {
+            'total_connections': self.connection_stats['total_connections'],
+            'valid_connections': self.connection_stats['valid_connections'],
+            'probe_connections': self.connection_stats['probe_connections'],
+            'cups_connections': self.connection_stats['cups_connections'],
+            'android_connections': self.connection_stats['android_connections'],
+            'probe_percentage': round(
+                (self.connection_stats['probe_connections'] / 
+                max(1, self.connection_stats['total_connections'])) * 100, 
+                2
+            ),
+            'active_jobs': len(self.active_jobs),
+            'completed_jobs': len(self.completed_jobs),
+            'failed_jobs': len(self.failed_jobs)
+        }
+    
     async def _handle_get_printer_attributes(self, message: IPPMessage) -> bytes:
         response = io.BytesIO()
         
         # IPP header - usar la misma versión que el cliente
-        response.write(bytes(message.version_number))  # Respetar versión del cliente
+        response.write(bytes(message.version_number))
         response.write((0x0000).to_bytes(2, 'big'))  # successful-ok
         response.write(message.request_id.to_bytes(4, 'big'))
         
@@ -1209,6 +1368,9 @@ class IPPServer:
                 elif attr_name == 'printer-state-reasons':
                     self._write_attribute(response, 0x44, 'printer-state-reasons', 'none')
                 
+                elif attr_name == 'printer-state-message':
+                    self._write_attribute(response, 0x41, 'printer-state-message', 'ready')
+                
                 elif attr_name == 'printer-is-accepting-jobs':
                     self._write_attribute(response, 0x22, 'printer-is-accepting-jobs', (1).to_bytes(1, 'big'))
                 
@@ -1246,15 +1408,12 @@ class IPPServer:
                 elif attr_name == 'printer-mandatory-job-attributes':
                     self._write_attribute(response, 0x44, 'printer-mandatory-job-attributes', 'none')
 
-                elif attr_name == 'printer-state-message':
-                    self._write_attribute(response, 0x41, 'printer-state-message', 'ready')
-
                 elif attr_name == 'cups-version':
                     self._write_attribute(response, 0x41, 'cups-version', '2.4')
                 
                 elif attr_name == 'document-format-supported':
                     formats = ['application/octet-stream', 'image/pwg-raster', 'application/vnd.cups-raster',
-                               'image/urf', 'application/pdf', 'image/jpeg', 'image/png', 'text/plain']
+                            'image/urf', 'application/pdf', 'image/jpeg', 'image/png', 'text/plain']
                     for fmt in formats:
                         self._write_attribute(response, 0x49, 'document-format-supported', fmt)
                 
@@ -1274,7 +1433,7 @@ class IPPServer:
                 
                 elif attr_name == 'media-supported':
                     media_names = ['oe_roll_58mm', 'om_roll_58_203.2x3048', 'roll_max_58_203.2x3048',
-                                   'custom_58x3048mm', 'continuous_58x3048mm']
+                                'custom_58x3048mm', 'continuous_58x3048mm']
                     for media in media_names:
                         self._write_attribute(response, 0x44, 'media-supported', media)
                 
@@ -1341,6 +1500,48 @@ class IPPServer:
                     icon_base = f"http://{local_ip}:{self.port}"
                     self._write_attribute(response, 0x45, 'printer-icons', f"{icon_base}/icon-small.png")
                     self._write_attribute(response, 0x45, 'printer-icons', f"{icon_base}/icon-large.png")
+                
+                # ===== NUEVOS ATRIBUTOS PARA CUPS COMPATIBILITY =====
+                elif attr_name == 'member-uris':
+                    # Para impresoras simples, no hay miembros
+                    pass
+                
+                elif attr_name == 'job-sheets-supported':
+                    self._write_attribute(response, 0x44, 'job-sheets-supported', 'none')
+                
+                elif attr_name == 'job-sheets-default':
+                    self._write_attribute(response, 0x44, 'job-sheets-default', 'none')
+                
+                elif attr_name == 'auth-info-required':
+                    self._write_attribute(response, 0x44, 'auth-info-required', 'none')
+                
+                elif attr_name == 'number-up-default':
+                    self._write_attribute(response, 0x21, 'number-up-default', (1).to_bytes(4, 'big'))
+                
+                elif attr_name == 'number-up-supported':
+                    self._write_attribute(response, 0x21, 'number-up-supported', (1).to_bytes(4, 'big') + (1).to_bytes(4, 'big'))
+                
+                elif attr_name == 'media-col-default':
+                    # Media collection por defecto
+                    media_default = 'media-size=58xvariable;media-type=continuous;media-source=main'
+                    self._write_attribute(response, 0x44, 'media-col-default', media_default)
+                
+                elif attr_name == 'media-size-supported':
+                    # Soporte para tamaño de medio (58mm ancho, largo variable)
+                    self._write_attribute(response, 0x44, 'media-size-supported', '58xvariable')
+                
+                elif attr_name == 'media-left-margin-supported':
+                    self._write_attribute(response, 0x21, 'media-left-margin-supported', (0).to_bytes(4, 'big'))
+                
+                elif attr_name == 'media-right-margin-supported':
+                    self._write_attribute(response, 0x21, 'media-right-margin-supported', (0).to_bytes(4, 'big'))
+                
+                elif attr_name == 'media-bottom-margin-supported':
+                    self._write_attribute(response, 0x21, 'media-bottom-margin-supported', (0).to_bytes(4, 'big'))
+                
+                elif attr_name == 'media-top-margin-supported':
+                    self._write_attribute(response, 0x21, 'media-top-margin-supported', (0).to_bytes(4, 'big'))
+                
                 else:
                     logger.debug(f"⚠️ Requested attribute '{attr_name}' not implemented")
             
@@ -1349,316 +1550,81 @@ class IPPServer:
             response_bytes = response.getvalue()
             logger.info(f"✅ FILTERED response: {len(response_bytes)} bytes for {len(requested_attrs)} attributes")
             
-            # Log response structure
-            logger.debug(f"Response header (hex): {response_bytes[:50].hex()}")
-            
             return response_bytes
         
         # ========== MODO COMPLETO: Enviar TODOS los atributos ==========
         logger.info("Sending complete attribute set (unfiltered)")
         
-        # printer-uri-supported - TODAS las variantes
-        for uri in printer_uris:
-            self._write_attribute(response, 0x45, 'printer-uri-supported', uri)
-        
-        # uri-authentication-supported
-        for _ in printer_uris:
-            self._write_attribute(response, 0x44, 'uri-authentication-supported', 'none')
-        
-        # uri-security-supported
-        for _ in printer_uris:
-            self._write_attribute(response, 0x44, 'uri-security-supported', 'none')
-        
-        # printer-name
-        self._write_attribute(response, 0x42, 'printer-name', settings.PRINTER_NAME)
-        
-        # printer-location
-        self._write_attribute(response, 0x41, 'printer-location', settings.PRINTER_LOCATION)
-        
-        # printer-info
-        self._write_attribute(response, 0x41, 'printer-info', settings.PRINTER_INFO)
-        
-        # printer-make-and-model
-        self._write_attribute(response, 0x41, 'printer-make-and-model', settings.PRINTER_MAKE_MODEL)
-        
-        # printer-state (3=idle, 4=processing, 5=stopped)
-        # Check printer backend status properly
-        if self.printer_backend and hasattr(self.printer_backend, 'is_ready'):
-            if self.printer_backend.is_ready():
-                state = 3  # idle - printer is ready
+        try:
+            # printer-uri-supported - TODAS las variantes
+            for uri in printer_uris:
+                self._write_attribute(response, 0x45, 'printer-uri-supported', uri)
+            
+            # uri-authentication-supported
+            for _ in printer_uris:
+                self._write_attribute(response, 0x44, 'uri-authentication-supported', 'none')
+            
+            # uri-security-supported
+            for _ in printer_uris:
+                self._write_attribute(response, 0x44, 'uri-security-supported', 'none')
+            
+            # printer-name
+            self._write_attribute(response, 0x42, 'printer-name', settings.PRINTER_NAME)
+            
+            # printer-location
+            self._write_attribute(response, 0x41, 'printer-location', settings.PRINTER_LOCATION)
+            
+            # printer-info
+            self._write_attribute(response, 0x41, 'printer-info', settings.PRINTER_INFO)
+            
+            # printer-make-and-model
+            self._write_attribute(response, 0x41, 'printer-make-and-model', settings.PRINTER_MAKE_MODEL)
+            
+            # printer-state (3=idle, 4=processing, 5=stopped)
+            if self.printer_backend and hasattr(self.printer_backend, 'is_ready'):
+                state = 3 if self.printer_backend.is_ready() else 5
+            elif self.printer_backend and hasattr(self.printer_backend, 'is_connected'):
+                state = 3 if self.printer_backend.is_connected else 5
             else:
-                state = 5  # stopped - printer not ready
-        elif self.printer_backend and hasattr(self.printer_backend, 'is_connected'):
-            state = 3 if self.printer_backend.is_connected else 5
-        else:
-            state = 5  # stopped - no backend available
-        self._write_attribute(response, 0x23, 'printer-state', state.to_bytes(4, 'big'))
+                state = 5
+            self._write_attribute(response, 0x23, 'printer-state', state.to_bytes(4, 'big'))
+            
+            # printer-state-reasons
+            self._write_attribute(response, 0x44, 'printer-state-reasons', 'none')
+            
+            # printer-is-accepting-jobs
+            self._write_attribute(response, 0x22, 'printer-is-accepting-jobs', (1).to_bytes(1, 'big'))
+            
+            # queued-job-count
+            self._write_attribute(response, 0x21, 'queued-job-count', len(self.active_jobs).to_bytes(4, 'big'))
+            
+            # operations-supported
+            for op_id in self.SUPPORTED_OPERATIONS.keys():
+                self._write_attribute(response, 0x23, 'operations-supported', op_id.to_bytes(4, 'big'))
+            
+            # document-format-supported
+            formats = ['application/octet-stream', 'image/pwg-raster', 'application/vnd.cups-raster',
+                    'image/urf', 'application/pdf', 'image/jpeg', 'image/png', 'text/plain']
+            for fmt in formats:
+                self._write_attribute(response, 0x49, 'document-format-supported', fmt)
+            
+            # document-format-default
+            self._write_attribute(response, 0x49, 'document-format-default', 'application/octet-stream')
+            
+            # Aqui van todos los demás atributos que necesite el modo completo, espero que no sean mas...
+            
+            # End of attributes
+            response.write(bytes([0x03]))
+            
+            response_bytes = response.getvalue()
+            logger.info(f"✅ COMPLETE response: {len(response_bytes)} bytes")
+            return response_bytes
+            
+        except Exception as e:
+            logger.error(f"❌ Error generating complete attributes response: {e}")
+            # Fallback: enviar respuesta de error
+            return self._create_error_response(message.request_id, 0x0500, message.version_number)
         
-        # printer-state-reasons
-        reasons = 'none'
-        self._write_attribute(response, 0x44, 'printer-state-reasons', reasons)
-        
-        # printer-is-accepting-jobs - CRUCIAL para CUPS
-        self._write_attribute(response, 0x22, 'printer-is-accepting-jobs', (1).to_bytes(1, 'big'))
-        
-        # queued-job-count - CUPS lo revisa
-        self._write_attribute(response, 0x21, 'queued-job-count', len(self.active_jobs).to_bytes(4, 'big'))
-        
-        # operations-supported - En orden de preferencia para CUPS
-        for op_id in self.SUPPORTED_OPERATIONS.keys():
-            self._write_attribute(response, 0x23, 'operations-supported', op_id.to_bytes(4, 'big'))
-        
-        # document-format-supported - ORDEN IMPORTANTE: preferir formatos raw primero
-        formats = [
-            'application/octet-stream',  # Raw - PRIMERO para que Android lo prefiera
-            'image/pwg-raster',          # PWG Raster - formato estándar IPP
-            'application/vnd.cups-raster',  # CUPS raster
-            'image/urf',                 # URF para AirPrint
-            'application/pdf',
-            'image/jpeg',
-            'image/png',
-            'text/plain',
-        ]
-        for fmt in formats:
-            self._write_attribute(response, 0x49, 'document-format-supported', fmt)
-        
-        # document-format-default - RAW para procesamiento local
-        self._write_attribute(response, 0x49, 'document-format-default', 'application/octet-stream')
-        
-        # document-format-preferred - PWG Raster es el estándar
-        self._write_attribute(response, 0x49, 'document-format-preferred', 'image/pwg-raster')
-        
-        # charset-supported
-        for charset in ['utf-8', 'us-ascii']:
-            self._write_attribute(response, 0x47, 'charset-supported', charset)
-        self._write_attribute(response, 0x47, 'charset-configured', 'utf-8')
-        
-        # natural-language-supported
-        for lang in ['en-us', 'es-es', 'es']:
-            self._write_attribute(response, 0x48, 'natural-language-supported', lang)
-        self._write_attribute(response, 0x48, 'natural-language-configured', 'en-us')
-        
-        # Media supported - 58mm thermal roll
-        media_names = [
-            'oe_roll_58mm',              # Nombre genérico
-            'om_roll_58_203.2x3048',     # Formato Mopria
-            'roll_max_58_203.2x3048',
-            'custom_58x3048mm',
-            'continuous_58x3048mm',
-        ]
-        for media in media_names:
-            self._write_attribute(response, 0x44, 'media-supported', media)
-        
-        self._write_attribute(response, 0x44, 'media-default', 'oe_roll_58mm')
-        self._write_attribute(response, 0x44, 'media-ready', 'oe_roll_58mm')
-        
-        # media-col-database (CUPS consulta esto para media details)
-        # Nota: IPP define media-col como una collection; aquí devolvemos nombres disponibles como texto simple
-        for media in media_names:
-            self._write_attribute(response, 0x44, 'media-col-database', media)
-        # También incluir un entry genérico con tamaño en mm (aprox 58mm x variable)
-        self._write_attribute(response, 0x44, 'media-col-database', 'media-size:58xvariable;media-type:continuous;media-source:main')
-
-        # media-col-supported (atributos de media collection)
-        media_col_attrs = ['media-size', 'media-type', 'media-source']
-        for attr in media_col_attrs:
-            self._write_attribute(response, 0x44, 'media-col-supported', attr)
-        
-        # media-type-supported
-        self._write_attribute(response, 0x44, 'media-type-supported', 'continuous')
-        self._write_attribute(response, 0x44, 'media-source-supported', 'main')
-        
-        # Print quality
-        for quality in [3, 4, 5]:  # draft, normal, high
-            self._write_attribute(response, 0x23, 'print-quality-supported', quality.to_bytes(4, 'big'))
-        self._write_attribute(response, 0x23, 'print-quality-default', (4).to_bytes(4, 'big'))
-        
-        # Color capabilities
-        self._write_attribute(response, 0x22, 'color-supported', (0).to_bytes(1, 'big'))
-        self._write_attribute(response, 0x44, 'print-color-mode-supported', 'monochrome')
-        self._write_attribute(response, 0x44, 'print-color-mode-default', 'monochrome')
-        
-        # Resolution - 203 DPI (8 dots/mm)
-        resolution = (203).to_bytes(4, 'big') + (203).to_bytes(4, 'big') + (3).to_bytes(1, 'big')
-        self._write_attribute(response, 0x32, 'printer-resolution-supported', resolution)
-        self._write_attribute(response, 0x32, 'printer-resolution-default', resolution)
-        
-        # PWG Raster capabilities
-        self._write_attribute(response, 0x44, 'pwg-raster-document-type-supported', 'black_1')
-        self._write_attribute(response, 0x44, 'pwg-raster-document-sheet-back', 'normal')
-        self._write_attribute(response, 0x21, 'pwg-raster-document-resolution-supported', resolution)
-        
-        # Sides (impresión duplex)
-        self._write_attribute(response, 0x44, 'sides-supported', 'one-sided')
-        self._write_attribute(response, 0x44, 'sides-default', 'one-sided')
-        
-        # Orientation
-        for orientation in [3, 4, 5, 6]:  # portrait, landscape, reverse-portrait, reverse-landscape
-            self._write_attribute(response, 0x23, 'orientation-requested-supported', orientation.to_bytes(4, 'big'))
-        self._write_attribute(response, 0x23, 'orientation-requested-default', (3).to_bytes(4, 'big'))
-        
-        # Compression
-        for compression in ['none', 'gzip', 'deflate']:
-            self._write_attribute(response, 0x44, 'compression-supported', compression)
-        
-        # IPP versions
-        for version in ['1.1', '2.0', '2.1', '2.2']:
-            self._write_attribute(response, 0x44, 'ipp-versions-supported', version)
-        
-        # ipp-features-supported
-        for feature in ['ipp-everywhere', 'none']:
-            self._write_attribute(response, 0x44, 'ipp-features-supported', feature)
-        
-        # Job management
-        self._write_attribute(response, 0x21, 'job-priority-supported', (100).to_bytes(4, 'big'))
-        self._write_attribute(response, 0x21, 'job-priority-default', (50).to_bytes(4, 'big'))
-        self._write_attribute(response, 0x21, 'copies-supported', (1).to_bytes(4, 'big') + (99).to_bytes(4, 'big'))
-        self._write_attribute(response, 0x21, 'copies-default', (1).to_bytes(4, 'big'))
-        
-        # PDL override
-        self._write_attribute(response, 0x44, 'pdl-override-supported', 'not-attempted')
-        
-        # Finishings
-        self._write_attribute(response, 0x23, 'finishings-supported', (3).to_bytes(4, 'big'))  # none
-        self._write_attribute(response, 0x23, 'finishings-default', (3).to_bytes(4, 'big'))
-        
-        # output-bin-supported (solicitado comúnmente por CUPS)
-        self._write_attribute(response, 0x44, 'output-bin-supported', 'face-down')
-        self._write_attribute(response, 0x44, 'output-bin-default', 'face-down')
-        
-        # Page ranges
-        self._write_attribute(response, 0x22, 'page-ranges-supported', (1).to_bytes(1, 'big'))
-        
-        # Multiple document handling
-        self._write_attribute(response, 0x44, 'multiple-document-handling-supported', 'separate-documents-uncollated-copies')
-        
-        # Printer more info
-        more_info = f'http://{local_ip}:{self.port}/'
-        self._write_attribute(response, 0x45, 'printer-more-info', more_info)
-        
-        # Device UUID
-        uuid_value = settings.MDNS_TXT_RECORDS.get('UUID', '12345678-1234-1234-1234-123456789012')
-        self._write_attribute(response, 0x45, 'printer-uuid', f'urn:uuid:{uuid_value}')
-        
-        # printer-device-id (formato IEEE 1284)
-        device_id = f'MFG:{settings.PRINTER_MAKE_MODEL.split()[0]};MDL:{settings.PRINTER_NAME};CLS:PRINTER;DES:Thermal Receipt Printer;CMD:ESC/POS;'
-        self._write_attribute(response, 0x41, 'printer-device-id', device_id)
-
-        # device-uri (CUPS compatibility)
-        device_uri = f"usb://{settings.PRINTER_MAKE_MODEL.replace(' ', '%20')}"
-        self._write_attribute(response, 0x45, 'device-uri', device_uri)
-
-        # printer-type (CRÍTICO para CUPS discovery)
-        # Bits según CUPS/IPP specification:
-        # 0x0002 = CUPS_PRINTER_CLASS
-        # 0x0004 = CUPS_PRINTER_REMOTE  
-        # 0x0008 = CUPS_PRINTER_BW (monochrome)
-        # 0x0010 = CUPS_PRINTER_COLOR
-        # 0x0020 = CUPS_PRINTER_DUPLEX
-        # 0x0040 = CUPS_PRINTER_STAPLE
-        # 0x0080 = CUPS_PRINTER_COPIES
-        # 0x0100 = CUPS_PRINTER_COLLATE
-        # 0x0200 = CUPS_PRINTER_PUNCH
-        # 0x0400 = CUPS_PRINTER_COVER
-        # 0x0800 = CUPS_PRINTER_BIND
-        # 0x1000 = CUPS_PRINTER_SORT
-        # 0x2000 = CUPS_PRINTER_SMALL
-        # 0x4000 = CUPS_PRINTER_MEDIUM
-        # 0x8000 = CUPS_PRINTER_LARGE
-        # 0x10000 = CUPS_PRINTER_VARIABLE (tamaño variable)
-        # 0x20000 = CUPS_PRINTER_IMPLICIT
-        # 0x40000 = CUPS_PRINTER_DEFAULT
-        # 0x80000 = CUPS_PRINTER_FAX
-        # 0x100000 = CUPS_PRINTER_REJECTING
-        # 0x200000 = CUPS_PRINTER_DELETE
-        # 0x400000 = CUPS_PRINTER_NOT_SHARED
-        # 0x800000 = CUPS_PRINTER_AUTHENTICATED
-        # 0x1000000 = CUPS_PRINTER_COMMANDS
-        # 0x2000000 = CUPS_PRINTER_DISCOVERED
-
-        # Para impresora térmica 58mm: LOCAL + BW + SMALL + VARIABLE + NOT_SHARED + IMPLICIT
-        printer_type = (
-            0x0008 |      # BW (monochrome)
-            0x2000 |      # SMALL (58mm es pequeño)
-            0x10000 |     # VARIABLE (tamaño de papel variable)
-            0x20000 |     # IMPLICIT (impresora implícita)
-            0x400000      # NOT_SHARED (no compartida en red por defecto)
-        )
-        # Resultado: 0x432008
-        
-        # printer-type-mask (requerido por RFC 8011)
-        printer_type_mask = 0xFFFFFFFF  # Mask completo
-
-        # Escribir printer-type
-        self._write_attribute(response, 0x23, 'printer-type', printer_type.to_bytes(4, 'big'))
-        logger.debug(f"Added printer-type: 0x{printer_type:06x}")
-        
-        # Escribir printer-type-mask
-        self._write_attribute(response, 0x23, 'printer-type-mask', printer_type_mask.to_bytes(4, 'big'))
-        logger.debug(f"Added printer-type-mask: 0x{printer_type_mask:08x}")
-        
-        # Log version being sent
-        logger.debug(f"Response IPP version: {message.version_number[0]}.{message.version_number[1]}")
-        
-        # Printer kind
-        for kind in ['document', 'receipt']:
-            self._write_attribute(response, 0x44, 'printer-kind', kind)
-        
-        # URI schemes
-        for scheme in ['ipp', 'http']:
-            self._write_attribute(response, 0x45, 'uri-scheme-supported', scheme)
-        
-        # which-jobs-supported
-        for which in ['completed', 'not-completed', 'all']:
-            self._write_attribute(response, 0x44, 'which-jobs-supported', which)
-        
-        # job-ids-supported - Rango de IDs de trabajos
-        self._write_attribute(response, 0x22, 'job-ids-supported', (1).to_bytes(1, 'big'))
-        
-        # job-k-octets-supported - Tamaño máximo de trabajos (10MB)
-        self._write_attribute(response, 0x33, 'job-k-octets-supported', (0).to_bytes(4, 'big') + (10240).to_bytes(4, 'big'))
-        
-        # job-impressions-supported (páginas/impresiones)
-        self._write_attribute(response, 0x33, 'job-impressions-supported', (0).to_bytes(4, 'big') + (999).to_bytes(4, 'big'))
-        
-        # job-media-sheets-supported (hojas de papel)
-        self._write_attribute(response, 0x33, 'job-media-sheets-supported', (0).to_bytes(4, 'big') + (999).to_bytes(4, 'big'))
-        
-        # printer-up-time (seconds since start)
-        uptime = int(time.time() - self._start_time)
-        self._write_attribute(response, 0x21, 'printer-up-time', uptime.to_bytes(4, 'big'))
-        
-        # printer-current-time
-        now = datetime.now()
-        current_time = (
-            now.year.to_bytes(2, 'big') +
-            now.month.to_bytes(1, 'big') +
-            now.day.to_bytes(1, 'big') +
-            now.hour.to_bytes(1, 'big') +
-            now.minute.to_bytes(1, 'big') +
-            now.second.to_bytes(1, 'big') +
-            (0).to_bytes(1, 'big') +  # deciseconds
-            b'+' +  # direction from UTC
-            (0).to_bytes(1, 'big') +  # hours from UTC
-            (0).to_bytes(1, 'big')    # minutes from UTC
-        )
-        self._write_attribute(response, 0x31, 'printer-current-time', current_time)
-        
-        # End of attributes
-        response.write(bytes([0x03]))
-        
-        response_bytes = response.getvalue()
-        logger.debug(f"✅ Generated printer attributes response: {len(response_bytes)} bytes")
-        
-        # Log first 50 bytes in hex for debugging
-        header_hex = response_bytes[:50].hex()
-        logger.debug(f"Response header (hex): {header_hex}")
-        logger.debug(f"IPP version bytes: {response_bytes[0]:02x} {response_bytes[1]:02x}")
-        logger.debug(f"Status code: {int.from_bytes(response_bytes[2:4], 'big'):04x}")
-        logger.debug(f"Request ID: {int.from_bytes(response_bytes[4:8], 'big')}")
-        
-        return response_bytes
-    
     async def _handle_get_jobs(self, message: IPPMessage) -> bytes:
         response = io.BytesIO()
         
@@ -1770,6 +1736,9 @@ class IPPServer:
         await writer.drain()
     
     async def _handle_status_request(self, writer: asyncio.StreamWriter, keep_alive: bool = False):
+        """
+        REEMPLAZAR el método _handle_status_request con esta versión mejorada
+        """
         status = {
             'server': {
                 'name': settings.PRINTER_NAME,
@@ -1787,7 +1756,8 @@ class IPPServer:
                 'completed': len(self.completed_jobs),
                 'failed': len(self.failed_jobs)
             },
-            'network': self.port_manager.get_network_info()
+            'network': self.port_manager.get_network_info(),
+            'connections': self.get_connection_statistics()  # NUEVO
         }
         
         json_content = json.dumps(status, indent=2, default=str)
@@ -1990,32 +1960,22 @@ class IPPServer:
     
 
     def _log_cups_handshake(self, client_ip: str, operation: str, headers: dict, message: IPPMessage = None):
-        logger.debug("=" * 60)
-        logger.debug(f"CUPS HANDSHAKE DEBUG - {operation}")
-        logger.debug("=" * 60)
-        logger.debug(f"Client IP: {client_ip}")
-        logger.debug(f"Operation: {operation}")
+        """
+        REEMPLAZAR el método _log_cups_handshake con esta versión más silenciosa
+        """
+        # Solo loguear en modo DEBUG muy detallado
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
         
-        logger.debug("\nHTTP Headers:")
-        for key, value in headers.items():
-            logger.debug(f"  {key}: {value}")
-        
-        if message:
-            logger.debug(f"\nIPP Message:")
-            logger.debug(f"  Version: {message.version_number}")
-            logger.debug(f"  Operation ID: 0x{message.operation_id:04x}")
-            logger.debug(f"  Request ID: {message.request_id}")
-            logger.debug(f"  Operation Attributes: {len(message.operation_attributes)}")
-            
-            if message.operation_attributes:
-                logger.debug(f"\n  Operation Attributes Detail:")
-                for attr_name, attr_value in list(message.operation_attributes.items())[:5]:
-                    logger.debug(f"    {attr_name} = {attr_value.value}")
-            
-            if message.document_data:
-                logger.debug(f"\n  Document Data: {len(message.document_data)} bytes")
-        
-        logger.debug("=" * 60)
+        # Solo loguear CUPS handshakes si hay contenido IPP real
+        if message and message.operation_id:
+            logger.debug("=" * 60)
+            logger.debug(f"CUPS HANDSHAKE - {operation}")
+            logger.debug("=" * 60)
+            logger.debug(f"Client: {client_ip}")
+            logger.debug(f"Operation: 0x{message.operation_id:04x}")
+            logger.debug(f"Attributes: {len(message.operation_attributes)}")
+            logger.debug("=" * 60)
     
     def get_connection_info(self) -> Dict[str, Any]:
         network_info = self.port_manager.get_network_info()
