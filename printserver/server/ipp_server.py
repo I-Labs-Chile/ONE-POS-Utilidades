@@ -258,6 +258,7 @@ class IPPServer:
         self.completed_jobs = []
         self.failed_jobs = []
         self.job_counter = 1
+        self.job_retention_seconds = 300  # Mantener jobs completados por 5 minutos
         
         # Server state
         self.is_running = False
@@ -927,7 +928,7 @@ class IPPServer:
                 logger.debug("Routing to _handle_get_printer_attributes")
                 return await self._handle_get_printer_attributes(message)
             elif message.operation_id == 0x000a:  # Get-Jobs
-                logger.debug("Routing to _handle_get_jobs")
+                logger.info(f"🔧 Get-Jobs from {client_ip}")
                 return await self._handle_get_jobs(message)
             elif message.operation_id == 0x0004:  # Validate-Job
                 logger.debug("Routing to _handle_validate_job")
@@ -1062,6 +1063,23 @@ class IPPServer:
         
         return job_id
     
+    async def _schedule_job_removal(self, job_id: int):
+        """
+        Remueve un job de active_jobs después del período de retención.
+        Esto permite que CUPS pueda consultar el estado del job antes de que desaparezca.
+        """
+        try:
+            await asyncio.sleep(self.job_retention_seconds)
+            
+            if job_id in self.active_jobs:
+                job = self.active_jobs.pop(job_id)
+                logger.info(f"🗑️  Job {job_id} removed from active queue (state: {job['state']})")
+                
+        except asyncio.CancelledError:
+            logger.debug(f"Job {job_id} removal task cancelled")
+        except Exception as e:
+            logger.error(f"Error removing job {job_id}: {e}")
+    
     async def _process_print_job(self, job_id: int, document_data: bytes, document_format: str, job_name: str = "Unnamed"):
         job = self.active_jobs.get(job_id)
         if not job:
@@ -1185,17 +1203,18 @@ class IPPServer:
             import traceback
             logger.debug(f"Job processing error traceback: {traceback.format_exc()}")
         finally:
-            # Move job to completed/failed list
+            # Mark completion time but KEEP in active_jobs for CUPS to query
             job['completion_time'] = datetime.now()
+            
             if job['state'] == 'completed':
                 self.completed_jobs.append(job)
-                logger.info(f"✅ Job {job_id} completed and archived")
+                logger.info(f"✅ Job {job_id} completed - kept in queue for CUPS")
             else:
                 self.failed_jobs.append(job)
                 logger.warning(f"❌ Job {job_id} failed with state: {job['state']}")
             
-            # Remove from active jobs
-            self.active_jobs.pop(job_id, None)
+            # Schedule job removal after retention period
+            asyncio.create_task(self._schedule_job_removal(job_id))
     
     def _create_print_job_response(self, request_id: int, job_id: int, version: tuple = (2, 0)) -> bytes:
         response = io.BytesIO()
@@ -1231,38 +1250,85 @@ class IPPServer:
         response.write(bytes([0x03]))
         
         return response.getvalue()
-    
+
     def _get_requested_attributes(self, message: IPPMessage) -> list:
-        """Extrae la lista de atributos solicitados del mensaje IPP"""
+        """
+        Versión mejorada que maneja correctamente atributos vacíos y multi-valor.
+        
+        PROBLEMA ORIGINAL: No manejaba correctamente cuando requested-attributes
+        está vacío o tiene valores None/vacíos.
+        """
         if 'requested-attributes' not in message.operation_attributes:
             return []  # Vacío => enviar todo
 
         attr_obj = message.operation_attributes['requested-attributes']
         values = []
 
+        # Manejar tanto listas como valores individuales
         if isinstance(attr_obj, list):
             for a in attr_obj:
                 val = a.value
+                if val is None:
+                    continue  # Saltar None
                 if isinstance(val, bytes):
-                    values.append(val.decode('utf-8', errors='ignore'))
-                else:
-                    values.append(str(val))
+                    decoded = val.decode('utf-8', errors='ignore').strip()
+                    if decoded:  # Solo agregar si no está vacío
+                        values.append(decoded)
+                elif isinstance(val, str):
+                    stripped = val.strip()
+                    if stripped:
+                        values.append(stripped)
         else:
             val = attr_obj.value
-            if isinstance(val, bytes):
-                values.append(val.decode('utf-8', errors='ignore'))
-            else:
-                values.append(str(val))
+            if val is not None:
+                if isinstance(val, bytes):
+                    decoded = val.decode('utf-8', errors='ignore').strip()
+                    if decoded:
+                        values.append(decoded)
+                elif isinstance(val, str):
+                    stripped = val.strip()
+                    if stripped:
+                        values.append(stripped)
 
-        # Normalizar y eliminar vacíos/duplicados conservando orden
+        # Eliminar duplicados preservando orden
         cleaned = []
         seen = set()
         for v in values:
-            v_strip = v.strip()
-            if v_strip and v_strip not in seen:
-                cleaned.append(v_strip)
-                seen.add(v_strip)
+            if v and v not in seen:
+                cleaned.append(v)
+                seen.add(v)
+        
         return cleaned
+    
+    def _get_marker_attributes(self) -> dict:
+        """
+        Retorna atributos de marcadores (tinta/papel) para CUPS.
+        
+        Para impresoras térmicas sin cartuchos, enviamos valores por defecto
+        que indican "no aplicable" o "desconocido".
+        """
+        return {
+            # marker-colors: Lista de colores (vacío para monocromático)
+            'marker-colors': ['#000000'],  # Negro para térmicas
+            
+            # marker-names: Nombres de los marcadores
+            'marker-names': ['Thermal Paper'],
+            
+            # marker-types: Tipo de marcador (ribbonWax, tonerCartridge, etc)
+            'marker-types': ['continuous-supply'],
+            
+            # marker-levels: Nivel actual (0-100, -1=desconocido, -2=no aplica, -3=unknown)
+            'marker-levels': [-3],  # -3 = unknown (CUPS lo acepta)
+            
+            # marker-high-levels: Nivel alto (umbral)
+            'marker-high-levels': [100],
+            
+            # marker-low-levels: Nivel bajo (umbral)
+            'marker-low-levels': [10],
+            
+            # marker-message: Mensaje del estado del marcador
+            'marker-message': [''],
+        }
     
     def get_connection_statistics(self) -> Dict[str, Any]:
         """
@@ -1308,9 +1374,9 @@ class IPPServer:
         send_all = not requested_attrs or 'all' in requested_attrs
         
         if requested_attrs and not send_all:
-            logger.info(f"📋 Client requested SPECIFIC attributes: {requested_attrs}")
+            logger.info(f"📋 CUPS requested {len(requested_attrs)} specific attributes")
         else:
-            logger.info("📋 Sending ALL attributes (no filter requested)")
+            logger.info("📋 Sending ALL attributes")
         
         # Printer attributes group
         response.write(bytes([0x04]))
@@ -1318,6 +1384,8 @@ class IPPServer:
         # Get actual network information
         network_info = self.port_manager.get_network_info()
         local_ip = network_info['local_ip']
+        if local_ip == '0.0.0.0':
+            local_ip = '127.0.0.1'
         
         # Definir URIs disponibles
         printer_uris = [
@@ -1327,6 +1395,9 @@ class IPPServer:
             f'http://{local_ip}:{self.port}/ipp/printer',
             f'ipp://{local_ip}:{self.port}/ipp',
         ]
+        
+        # Obtener atributos de marcadores
+        marker_attrs = self._get_marker_attributes()
         
         # Si se solicitan atributos específicos, solo enviarlos
         if not send_all:
@@ -1542,18 +1613,51 @@ class IPPServer:
                 elif attr_name == 'media-top-margin-supported':
                     self._write_attribute(response, 0x21, 'media-top-margin-supported', (0).to_bytes(4, 'big'))
                 
+                # ===== ATRIBUTOS DE MARCADORES (CRÍTICO PARA CUPS) =====
+                elif attr_name == 'marker-colors':
+                    for color in marker_attrs['marker-colors']:
+                        self._write_attribute(response, 0x44, 'marker-colors', color)
+                
+                elif attr_name == 'marker-names':
+                    for name in marker_attrs['marker-names']:
+                        self._write_attribute(response, 0x42, 'marker-names', name)
+                
+                elif attr_name == 'marker-types':
+                    for mtype in marker_attrs['marker-types']:
+                        self._write_attribute(response, 0x44, 'marker-types', mtype)
+                
+                elif attr_name == 'marker-levels':
+                    for level in marker_attrs['marker-levels']:
+                        self._write_attribute(response, 0x21, 'marker-levels', level.to_bytes(4, 'big', signed=True))
+                
+                elif attr_name == 'marker-high-levels':
+                    for level in marker_attrs['marker-high-levels']:
+                        self._write_attribute(response, 0x21, 'marker-high-levels', level.to_bytes(4, 'big'))
+                
+                elif attr_name == 'marker-low-levels':
+                    for level in marker_attrs['marker-low-levels']:
+                        self._write_attribute(response, 0x21, 'marker-low-levels', level.to_bytes(4, 'big'))
+                
+                elif attr_name == 'marker-message':
+                    for msg in marker_attrs['marker-message']:
+                        self._write_attribute(response, 0x41, 'marker-message', msg)
+                
+                elif attr_name == 'job-password-encryption-supported':
+                    self._write_attribute(response, 0x44, 'job-password-encryption-supported', 'none')
+                
                 else:
                     logger.debug(f"⚠️ Requested attribute '{attr_name}' not implemented")
             
             # End of attributes
             response.write(bytes([0x03]))
             response_bytes = response.getvalue()
-            logger.info(f"✅ FILTERED response: {len(response_bytes)} bytes for {len(requested_attrs)} attributes")
+            logger.info(f"✅ Get-Printer-Attributes response: {len(response_bytes)} bytes, "
+                       f"{len(requested_attrs)} attributes")
             
             return response_bytes
         
         # ========== MODO COMPLETO: Enviar TODOS los atributos ==========
-        logger.info("Sending complete attribute set (unfiltered)")
+        logger.debug("Sending complete attribute set (unfiltered)")
         
         try:
             # printer-uri-supported - TODAS las variantes
@@ -1611,13 +1715,94 @@ class IPPServer:
             # document-format-default
             self._write_attribute(response, 0x49, 'document-format-default', 'application/octet-stream')
             
-            # Aqui van todos los demás atributos que necesite el modo completo, espero que no sean mas...
+            # ========== ATRIBUTOS DE MARCADORES (CRÍTICO PARA CUPS) ==========
+            # marker-colors
+            for color in marker_attrs['marker-colors']:
+                self._write_attribute(response, 0x44, 'marker-colors', color)
+            
+            # marker-names
+            for name in marker_attrs['marker-names']:
+                self._write_attribute(response, 0x42, 'marker-names', name)
+            
+            # marker-types
+            for mtype in marker_attrs['marker-types']:
+                self._write_attribute(response, 0x44, 'marker-types', mtype)
+            
+            # marker-levels
+            for level in marker_attrs['marker-levels']:
+                self._write_attribute(response, 0x21, 'marker-levels', level.to_bytes(4, 'big', signed=True))
+            
+            # marker-high-levels
+            for level in marker_attrs['marker-high-levels']:
+                self._write_attribute(response, 0x21, 'marker-high-levels', level.to_bytes(4, 'big'))
+            
+            # marker-low-levels
+            for level in marker_attrs['marker-low-levels']:
+                self._write_attribute(response, 0x21, 'marker-low-levels', level.to_bytes(4, 'big'))
+            
+            # marker-message
+            for msg in marker_attrs['marker-message']:
+                self._write_attribute(response, 0x41, 'marker-message', msg)
+            
+            # ========== ATRIBUTOS ADICIONALES CUPS ==========
+            # compression-supported
+            for comp in ['none', 'gzip', 'deflate']:
+                self._write_attribute(response, 0x44, 'compression-supported', comp)
+            
+            # copies-supported (rangeOfInteger)
+            self._write_attribute(response, 0x33, 'copies-supported', 
+                                (1).to_bytes(4, 'big') + (99).to_bytes(4, 'big'))
+            
+            # print-color-mode-supported
+            self._write_attribute(response, 0x44, 'print-color-mode-supported', 'monochrome')
+            
+            # media-col-supported
+            for attr in ['media-size', 'media-type', 'media-source']:
+                self._write_attribute(response, 0x44, 'media-col-supported', attr)
+            
+            # multiple-document-handling-supported
+            self._write_attribute(response, 0x44, 'multiple-document-handling-supported', 
+                                'separate-documents-uncollated-copies')
+            
+            # cups-version
+            self._write_attribute(response, 0x41, 'cups-version', '2.4')
+            
+            # job-password-encryption-supported
+            self._write_attribute(response, 0x44, 'job-password-encryption-supported', 'none')
+            
+            # printer-alert
+            self._write_attribute(response, 0x44, 'printer-alert', 'none')
+            
+            # printer-alert-description
+            self._write_attribute(response, 0x41, 'printer-alert-description', 'none')
+            
+            # printer-mandatory-job-attributes
+            self._write_attribute(response, 0x44, 'printer-mandatory-job-attributes', 'none')
+            
+            # ipp-versions-supported
+            for version in ['1.1', '2.0', '2.1']:
+                self._write_attribute(response, 0x44, 'ipp-versions-supported', version)
+            
+            # charset-supported
+            for charset in ['utf-8', 'us-ascii']:
+                self._write_attribute(response, 0x47, 'charset-supported', charset)
+            
+            # natural-language-supported
+            for lang in ['en-us', 'es-es']:
+                self._write_attribute(response, 0x48, 'natural-language-supported', lang)
+            
+            # media-supported
+            for media in ['oe_roll_58mm', 'roll_max_58_203.2x3048']:
+                self._write_attribute(response, 0x44, 'media-supported', media)
+            
+            # media-default
+            self._write_attribute(response, 0x44, 'media-default', 'oe_roll_58mm')
             
             # End of attributes
             response.write(bytes([0x03]))
             
             response_bytes = response.getvalue()
-            logger.info(f"✅ COMPLETE response: {len(response_bytes)} bytes")
+            logger.info(f"✅ Get-Printer-Attributes response: {len(response_bytes)} bytes, ALL attributes")
             return response_bytes
             
         except Exception as e:
@@ -1638,6 +1823,9 @@ class IPPServer:
         self._write_attribute(response, 0x47, 'attributes-charset', 'utf-8')
         self._write_attribute(response, 0x48, 'attributes-natural-language', 'en-us')
         
+        # Log Get-Jobs request
+        logger.info(f"📋 Get-Jobs request - {len(self.active_jobs)} active jobs")
+        
         # Job attributes for each active job
         for job in self.active_jobs.values():
             response.write(bytes([0x02]))  # job-attributes-tag
@@ -1653,9 +1841,36 @@ class IPPServer:
             state_map = {'pending': 3, 'processing': 5, 'completed': 9, 'aborted': 8}
             state = state_map.get(job['state'], 3)
             self._write_attribute(response, 0x23, 'job-state', state.to_bytes(4, 'big'))
+            
+            # job-state-reasons
+            reasons = job.get('state_reasons', ['none'])
+            for reason in reasons:
+                self._write_attribute(response, 0x44, 'job-state-reasons', reason)
+            
+            # job-name (if available)
+            job_name = "Unknown"
+            if 'operation_attributes' in job and 'job-name' in job['operation_attributes']:
+                job_name_attr = job['operation_attributes']['job-name']
+                if hasattr(job_name_attr, 'value'):
+                    job_name = str(job_name_attr.value)
+            self._write_attribute(response, 0x42, 'job-name', job_name)
+            
+            # time-at-creation
+            if 'creation_time' in job:
+                creation_ts = int(job['creation_time'].timestamp())
+                self._write_attribute(response, 0x21, 'time-at-creation', creation_ts.to_bytes(4, 'big'))
+            
+            # time-at-completed (if completed)
+            if 'completion_time' in job:
+                completion_ts = int(job['completion_time'].timestamp())
+                self._write_attribute(response, 0x21, 'time-at-completed', completion_ts.to_bytes(4, 'big'))
+            
+            logger.debug(f"  Job {job['id']}: state={job['state']} ({state}), name={job_name}")
         
         # End of attributes
         response.write(bytes([0x03]))
+        
+        logger.info(f"✅ Get-Jobs response: {len(self.active_jobs)} jobs returned")
         
         return response.getvalue()
     
