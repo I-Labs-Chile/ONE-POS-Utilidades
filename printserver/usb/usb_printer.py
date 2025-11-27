@@ -7,29 +7,31 @@ import os
 logger = logging.getLogger(__name__)
 
 class USBPrinterBackend:
-    
+
+    # Backend para operar una impresora USB mediante nodo de dispositivo.
     def __init__(self, device_path: Optional[str] = None):
 
+        # Ruta al nodo de dispositivo (ej: /dev/usb/lp0). Si es None, se detectará.
         self.device_path = device_path
         self.device_handle = None
         self.is_connected = False
         self.detector = USBPrinterDetector()
         self.current_printer: Optional[USBPrinterInfo] = None
-        
+
         logger.info("USBPrinterBackend initialized")
-        
+
         # Auto-detect si no se especificó device
         if not self.device_path:
             logger.info("No device path specified, will auto-detect on connect")
     
     def connect(self) -> bool:
 
+        # Intento de conexión a la impresora. Realiza auto-detección si es necesario.
         try:
-            # Si no tenemos device path, detectar automáticamente
             if not self.device_path:
                 logger.info("🔍 Auto-detecting printer...")
                 printers = self.detector.scan_for_printers()
-                
+
                 if not printers:
                     logger.error("❌ No printers detected")
                     logger.info("💡 Make sure:")
@@ -37,46 +39,45 @@ class USBPrinterBackend:
                     logger.info("   2. Printer is powered on")
                     logger.info("   3. User has permissions (add to lp/lpadmin group)")
                     return False
-                
+
                 # Usar la primera impresora detectada
                 self.current_printer = printers[0]
                 self.device_path = self.current_printer.device_path
-                
+
                 logger.info(f"✅ Auto-detected: {self.current_printer.friendly_name}")
                 logger.info(f"   Device: {self.device_path}")
-                
+
                 if self.current_printer.vendor_id:
                     logger.info(f"   Vendor ID: {self.current_printer.vendor_id}")
                 if self.current_printer.product_id:
                     logger.info(f"   Product ID: {self.current_printer.product_id}")
-                
-                # Verificar si es térmica conocida
+
                 if self.detector.is_thermal_printer(self.current_printer):
                     logger.info("   🔥 Thermal printer detected")
-            
+
             # Verificar que el dispositivo existe
             if not os.path.exists(self.device_path):
                 logger.error(f"❌ Device not found: {self.device_path}")
                 return False
-            
-            # Verificar permisos
+
+            # Verificar permisos de escritura
             if not self.detector.test_printer_connection(self.device_path):
                 logger.error(f"❌ Cannot write to {self.device_path}")
                 logger.info("💡 Try: sudo usermod -a -G lp $USER")
                 logger.info("   Then logout and login again")
                 return False
-            
-            # Abrir dispositivo
+
+            # Abrir dispositivo en modo binario sin buffering
             logger.info(f"🔌 Connecting to {self.device_path}...")
             self.device_handle = open(self.device_path, 'wb', buffering=0)
             self.is_connected = True
-            
-            # Enviar comando de inicialización
+
+            # Enviar comando de inicialización ESC @
             self._send_init_command()
-            
+
             logger.info(f"✅ Connected to printer: {self.device_path}")
             return True
-            
+
         except PermissionError:
             logger.error(f"❌ Permission denied: {self.device_path}")
             logger.info("💡 Run: sudo chmod 666 {self.device_path}")
@@ -88,10 +89,10 @@ class USBPrinterBackend:
             logger.debug(f"Connection error: {traceback.format_exc()}")
             return False
     
+    # Envía el comando de inicialización ESC @ a la impresora.
     def _send_init_command(self):
 
         try:
-            # ESC @ - Initialize printer
             init_cmd = b'\x1b@'
             self.device_handle.write(init_cmd)
             self.device_handle.flush()
@@ -100,6 +101,7 @@ class USBPrinterBackend:
         except Exception as e:
             logger.warning(f"Failed to send init command: {e}")
     
+    # Cierra el handle del dispositivo y marca como desconectado.
     def disconnect(self):
 
         if self.device_handle:
@@ -112,6 +114,7 @@ class USBPrinterBackend:
                 self.device_handle = None
                 self.is_connected = False
     
+    # Envía datos binarios crudos a la impresora; intenta conectar si no está conectado.
     def send_raw(self, data: bytes) -> bool:
 
         if not self.is_connected:
@@ -119,31 +122,30 @@ class USBPrinterBackend:
             if not self.connect():
                 logger.error("Failed to auto-connect")
                 return False
-        
+
         try:
             logger.debug(f"Sending {len(data)} bytes to printer...")
             self.device_handle.write(data)
             self.device_handle.flush()
             logger.info(f"✅ Sent {len(data)} bytes successfully")
             return True
-            
+
         except Exception as e:
             logger.error(f"❌ Failed to send data: {e}")
             self.is_connected = False
             return False
-    
+    # Indica si el backend está conectado y listo para enviar datos.
     def is_ready(self) -> bool:
-
         return self.is_connected
     
+    # Devuelve un diccionario con el estado actual de la impresora/backend.
     def get_status(self) -> dict:
-
         status = {
             'connected': self.is_connected,
             'device_path': self.device_path,
             'ready': self.is_ready()
         }
-        
+
         if self.current_printer:
             status.update({
                 'manufacturer': self.current_printer.manufacturer,
@@ -155,8 +157,8 @@ class USBPrinterBackend:
             })
         return status
     
+    # Reescanea el sistema y devuelve una lista con metadatos básicos de cada impresora.
     def rescan_printers(self) -> list:
-
         printers = self.detector.scan_for_printers()
         return [
             {

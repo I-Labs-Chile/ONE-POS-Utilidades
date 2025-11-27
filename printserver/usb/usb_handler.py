@@ -24,32 +24,40 @@ class USBDeviceNotFoundError(USBError):
 class USBCommunicationError(USBError):
     pass
 
+# Interfaz abstracta para controladores USB (libusb o archivo /dev).
 class USBHandler(ABC):
-    
+
+    # Abre y configura el dispositivo USB. Devuelve True si se abrió correctamente.
     @abstractmethod
     async def open_device(self, vendor_id: Optional[int] = None, product_id: Optional[int] = None) -> bool:
         pass
-    
+
+    # Escribe bytes al dispositivo. Devuelve la cantidad de bytes escritos.
     @abstractmethod
     async def write(self, data: bytes) -> int:
         pass
-    
+
+    # Lee hasta `size` bytes del dispositivo con un timeout (ms). Devuelve bytes leídos.
     @abstractmethod
     async def read(self, size: int, timeout: int = 1000) -> bytes:
         pass
-    
+
+    # Cierra y libera recursos asociados al dispositivo.
     @abstractmethod
     async def close(self):
         pass
-    
+
+    # Indica si hay una conexión abierta con el dispositivo.
     @abstractmethod
     def is_connected(self) -> bool:
         pass
-    
+
+    # Devuelve un diccionario con metadatos del dispositivo (vendor, product, serial, etc.).
     @abstractmethod
     def get_device_info(self) -> Dict[str, Any]:
         pass
 
+# Implementación de USBHandler usando PyUSB/libusb.
 class LibUSBHandler(USBHandler):
     
     def __init__(self, timeout: int = 5000):
@@ -66,6 +74,7 @@ class LibUSBHandler(USBHandler):
         
         # Configuraciones conocidas de impresoras térmicas
         self.thermal_printer_configs = [
+
             # (vendor_id, product_id, interface, out_endpoint, in_endpoint)
             (0x04b8, 0x0202, 0, 0x01, 0x82),  # Epson TM series
             (0x04b8, 0x0e03, 0, 0x01, 0x82),  # Epson TM-T20
@@ -81,6 +90,7 @@ class LibUSBHandler(USBHandler):
                 return True
             
             try:
+
                 # Encontrar dispositivo
                 if vendor_id and product_id:
                     self.device = usb.core.find(idVendor=vendor_id, idProduct=product_id)
@@ -108,6 +118,7 @@ class LibUSBHandler(USBHandler):
             raise USBCommunicationError("Dispositivo no abierto o sin endpoint de salida")
         
         try:
+
             # Dividir datos en fragmentos si es necesario
             max_packet_size = self.endpoint_out.wMaxPacketSize or 64
             total_written = 0
@@ -138,7 +149,6 @@ class LibUSBHandler(USBHandler):
             return bytes(data)
             
         except usb.core.USBTimeoutError:
-            # El tiempo de espera es esperado para dispositivos que no tienen datos
             return b""
         except usb.core.USBError as e:
             raise USBCommunicationError(f"Error de lectura USB: {e}")
@@ -149,7 +159,7 @@ class LibUSBHandler(USBHandler):
                 try:
                     usb.util.dispose_resources(self.device)
                 except:
-                    pass  # Ignorar errores de eliminación
+                    pass
                 
                 self.device = None
                 self.endpoint_out = None
@@ -189,6 +199,7 @@ class LibUSBHandler(USBHandler):
             }
     
     def _find_thermal_printer(self):
+
         # Intentar primero con configuraciones conocidas
         for vendor_id, product_id, _, _, _ in self.thermal_printer_configs:
             device = usb.core.find(idVendor=vendor_id, idProduct=product_id)
@@ -221,6 +232,7 @@ class LibUSBHandler(USBHandler):
             raise USBCommunicationError("No hay dispositivo para configurar")
         
         try:
+
             # Desvincular controlador del kernel si es necesario (Linux)
             if platform.system() == "Linux":
                 try:
@@ -228,8 +240,8 @@ class LibUSBHandler(USBHandler):
                         self.device.detach_kernel_driver(0)
                         logger.debug("Controlador del kernel desvinculado")
                 except usb.core.USBError:
-                    pass  # Puede que no sea necesario
-            
+                    pass # Es una variable que puede no ser necesaria
+
             # Establecer configuración
             try:
                 self.device.set_configuration()
@@ -271,8 +283,9 @@ class LibUSBHandler(USBHandler):
             return "Desconocido"
         return f"{self.device.idVendor:04x}:{self.device.idProduct:04x}"
 
+# Implementación de USBHandler que escribe directamente a un nodo de dispositivo (ej: /dev/usb/lp0).
 class FileUSBHandler(USBHandler):
-    
+
     def __init__(self, device_path: str = "/dev/usb/lp0"):
         self.device_path = device_path
         self.is_open = False
@@ -280,11 +293,9 @@ class FileUSBHandler(USBHandler):
     
     async def open_device(self, vendor_id: Optional[int] = None, product_id: Optional[int] = None) -> bool:
         try:
-            # Probar si podemos escribir en el archivo de dispositivo
             with open(self.device_path, 'wb') as f:
                 pass  # Solo probar apertura
-            
-            # Obtener información del archivo
+        
             import os
             import stat
             
@@ -340,9 +351,11 @@ def create_usb_handler(prefer_file: bool = False, **kwargs) -> USBHandler:
     system = platform.system()
     
     if prefer_file or not HAS_PYUSB:
+
         # Usar controlador basado en archivo
         device_path = kwargs.get('device_path', '/dev/usb/lp0')
         if system == "Linux":
+            
             # Probar rutas comunes de dispositivos impresora en Linux
             for path in ['/dev/usb/lp0', '/dev/usb/lp1', '/dev/lp0', '/dev/lp1']:
                 import os
@@ -353,6 +366,7 @@ def create_usb_handler(prefer_file: bool = False, **kwargs) -> USBHandler:
         return FileUSBHandler(device_path)
     
     else:
+
         # Usar controlador libusb
         timeout = kwargs.get('timeout', 5000)
         return LibUSBHandler(timeout)
@@ -363,6 +377,7 @@ async def list_usb_printers() -> List[Dict[str, Any]]:
     
     if HAS_PYUSB:
         try:
+
             # Encontrar todos los dispositivos de clase impresora
             devices = usb.core.find(find_all=True, bDeviceClass=7)  # Clase de impresora
             
@@ -398,9 +413,9 @@ async def list_usb_printers() -> List[Dict[str, Any]]:
     return printers
 
 if __name__ == "__main__":
+
     # Probar controlador USB
     async def test_usb_handler():
-        """Probar la funcionalidad del controlador USB"""
         print("Probando controlador USB...")
         
         # Listar impresoras disponibles
