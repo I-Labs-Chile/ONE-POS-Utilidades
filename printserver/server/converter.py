@@ -6,6 +6,7 @@ import asyncio
 import logging
 import io
 import os
+import time
 
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageEnhance
@@ -167,6 +168,56 @@ class DocumentConverter:
         preview = data[:100]
         return any(marker in preview for marker in escpos_markers)
     
+    def _is_image_wrapped_pdf(self, pdf_data: bytes) -> bool:
+        """
+        Detecta si un PDF contiene simplemente una imagen JPEG/PNG embebida.
+        Android a veces envía imágenes envueltas en PDF.
+        """
+        try:
+            # Buscar markers de imágenes embebidas en el PDF
+            # JPEG: buscar /DCTDecode o JFIF
+            # PNG: buscar /FlateDecode con datos PNG
+            if b'/DCTDecode' in pdf_data or b'JFIF' in pdf_data:
+                logger.debug("PDF contains embedded JPEG image")
+                return True
+            if b'/FlateDecode' in pdf_data and b'PNG' in pdf_data:
+                logger.debug("PDF contains embedded PNG image")
+                return True
+            return False
+        except:
+            return False
+    
+    async def _extract_image_from_pdf(self, pdf_data: bytes) -> Optional[Image.Image]:
+        """
+        Intenta extraer una imagen JPEG/PNG directamente de un PDF.
+        Más rápido que usar Ghostscript cuando el PDF es solo un wrapper.
+        """
+        try:
+            # Buscar marcador JPEG (FF D8 FF)
+            jpeg_start = pdf_data.find(b'\xFF\xD8\xFF')
+            if jpeg_start > 0:
+                # Buscar final de JPEG (FF D9)
+                jpeg_end = pdf_data.find(b'\xFF\xD9', jpeg_start)
+                if jpeg_end > jpeg_start:
+                    jpeg_data = pdf_data[jpeg_start:jpeg_end + 2]
+                    logger.info(f"📷 Extracted JPEG from PDF: {len(jpeg_data)} bytes")
+                    return await self._convert_image_to_bitmap(jpeg_data)
+            
+            # Buscar marcador PNG (89 50 4E 47)
+            png_start = pdf_data.find(b'\x89PNG')
+            if png_start > 0:
+                # PNG termina con IEND + CRC (49 45 4E 44 AE 42 60 82)
+                png_end = pdf_data.find(b'IEND', png_start)
+                if png_end > png_start:
+                    png_data = pdf_data[png_start:png_end + 8]  # +8 para incluir IEND + CRC
+                    logger.info(f"📷 Extracted PNG from PDF: {len(png_data)} bytes")
+                    return await self._convert_image_to_bitmap(png_data)
+            
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to extract image from PDF: {e}")
+            return None
+    
     async def _convert_to_bitmap(self, document_data: bytes, document_format: str) -> Image.Image:
         if document_format == "application/pdf":
             return await self._convert_pdf_to_bitmap(document_data)
@@ -188,6 +239,15 @@ class DocumentConverter:
             raise ConversionError("Pillow not available for image processing")
         
         try:
+            # Detección especial: PDF que contiene una imagen JPEG/PNG embebida
+            # Android a veces envía imágenes envueltas en PDF
+            if self._is_image_wrapped_pdf(pdf_data):
+                logger.info("📷 Detected image-wrapped PDF, extracting image directly")
+                extracted_image = await self._extract_image_from_pdf(pdf_data)
+                if extracted_image:
+                    return extracted_image
+                # Si falla extracción, continuar con ghostscript normal
+            
             with tempfile.TemporaryDirectory() as temp_dir:
                 pdf_path = os.path.join(temp_dir, "input.pdf")
                 png_path = os.path.join(temp_dir, "output-%03d.png")
@@ -195,6 +255,8 @@ class DocumentConverter:
                 # Write PDF to temporary file
                 with open(pdf_path, 'wb') as f:
                     f.write(pdf_data)
+                
+                logger.debug(f"Converting PDF with ghostscript: {len(pdf_data)} bytes")
                 
                 # Convert PDF to PNG using ghostscript
                 gs_cmd = [
@@ -220,11 +282,23 @@ class DocumentConverter:
                 
                 if process.returncode != 0:
                     error_msg = stderr.decode('utf-8', errors='ignore')
+                    logger.error(f"Ghostscript error (exit {process.returncode}): {error_msg}")
+                    
+                    # Guardar PDF problemático para debugging
+                    debug_pdf = Path(__file__).parent.parent / "debug_logs" / f"failed_pdf_{int(time.time())}.pdf"
+                    debug_pdf.parent.mkdir(exist_ok=True)
+                    with open(debug_pdf, 'wb') as f:
+                        f.write(pdf_data)
+                    logger.info(f"💾 Saved problematic PDF to: {debug_pdf}")
+                    
                     raise ConversionError(f"Ghostscript error: {error_msg}")
                 
                 # Load first page
                 first_page = os.path.join(temp_dir, "output-001.png")
                 if not os.path.exists(first_page):
+                    # Listar archivos generados para debugging
+                    generated_files = os.listdir(temp_dir)
+                    logger.error(f"Expected {first_page} but not found. Generated files: {generated_files}")
                     raise ConversionError("No output generated by ghostscript")
                 
                 image = Image.open(first_page)

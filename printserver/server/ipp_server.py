@@ -563,7 +563,69 @@ class IPPServer:
                 raw_request_line = request_line[:100]
                 logger.debug(f"[{client_ip}] Request line: {raw_request_line}")
                 
-                # Parse request line
+                # === DETECCIÓN DE RAW DATA (PDF/ESC/POS directo sin HTTP wrapper) ===
+                # Algunos clientes Android/iOS envían el documento directamente
+                if request_line.startswith(b'%PDF') or request_line.startswith(b'\x1b'):
+                    logger.info(f"📄 [Android/iOS] Raw document detected from {client_ip}")
+                    logger.info(f"📄 Document type: {'PDF' if request_line.startswith(b'%PDF') else 'ESC/POS'}")
+                    
+                    # Leer todo el documento
+                    document_data = request_line
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(reader.read(8192), timeout=5.0)
+                            if not chunk:
+                                break
+                            document_data += chunk
+                        except asyncio.TimeoutError:
+                            break
+                    
+                    logger.info(f"📄 Received raw document: {len(document_data)} bytes")
+                    
+                    # Procesar el documento directamente
+                    try:
+                        if request_line.startswith(b'%PDF'):
+                            # Es un PDF, convertir a ESC/POS
+                            from .converter import DocumentConverter
+                            converter = DocumentConverter()
+                            escpos_data = await converter.convert_to_escpos(document_data, 'application/pdf')
+                            logger.info(f"✅ PDF converted to ESC/POS: {len(escpos_data)} bytes")
+                        else:
+                            # Ya es ESC/POS, usar directamente
+                            escpos_data = document_data
+                            logger.info(f"✅ ESC/POS data received: {len(escpos_data)} bytes")
+                        
+                        # Enviar a la impresora
+                        if self.printer_backend and hasattr(self.printer_backend, 'is_connected'):
+                            if self.printer_backend.is_connected:
+                                success = await self.printer_backend.send_raw(escpos_data)
+                                if success:
+                                    logger.info(f"✅ Printed successfully: {len(escpos_data)} bytes sent to printer")
+                                else:
+                                    logger.error("❌ Failed to print document")
+                                
+                                # Enviar respuesta simple (algunos clientes no esperan respuesta)
+                                try:
+                                    writer.write(b"HTTP/1.1 200 OK\r\n")
+                                    writer.write(b"Content-Type: text/plain\r\n")
+                                    writer.write(b"Content-Length: 2\r\n")
+                                    writer.write(b"\r\n")
+                                    writer.write(b"OK")
+                                    await writer.drain()
+                                except:
+                                    pass  # Cliente puede haber cerrado conexión
+                            else:
+                                logger.error("❌ Printer not connected")
+                        
+                    except Exception as e:
+                        logger.error(f"❌ Error processing raw document: {e}")
+                        import traceback
+                        logger.debug(traceback.format_exc())
+                    
+                    # Cerrar conexión y salir del loop
+                    break
+                
+                # Parse request line (HTTP normal)
                 request_line_str = request_line.decode('utf-8', errors='ignore').strip()
                 if not request_line_str:
                     logger.warning(f"[{client_ip}] Empty request line, sending 400")
@@ -1811,6 +1873,366 @@ class IPPServer:
                     self._write_attribute(response, 0x45, 'printer-more-info', more_info_url)
                     logger.debug(f"✅ Sent printer-more-info: {more_info_url}")
                 
+                # ===== ATRIBUTOS AVANZADOS WINDOWS/CUPS =====
+                
+                elif attr_name == 'copies-default':
+                    # Número de copias por defecto
+                    self._write_attribute(response, 0x21, 'copies-default', (1).to_bytes(4, 'big'))
+                
+                elif attr_name == 'orientation-requested-supported':
+                    # Orientaciones soportadas: 3=portrait, 4=landscape
+                    for orientation in [3, 4]:
+                        self._write_attribute(response, 0x23, 'orientation-requested-supported', orientation.to_bytes(4, 'big'))
+                
+                elif attr_name == 'job-impressions-supported':
+                    # Rango de impresiones soportadas por trabajo (rangeOfInteger)
+                    self._write_attribute(response, 0x33, 'job-impressions-supported', (1).to_bytes(4, 'big') + (9999).to_bytes(4, 'big'))
+                
+                elif attr_name == 'job-pages-per-set-supported':
+                    # Rango de páginas por set (rangeOfInteger)
+                    self._write_attribute(response, 0x33, 'job-pages-per-set-supported', (1).to_bytes(4, 'big') + (9999).to_bytes(4, 'big'))
+                
+                elif attr_name == 'media-type-supported':
+                    # Tipos de papel soportados
+                    for media_type in ['stationery', 'continuous', 'labels']:
+                        self._write_attribute(response, 0x44, 'media-type-supported', media_type)
+                
+                elif attr_name == 'media-col-ready':
+                    # Media collection lista para usar (papel cargado actualmente)
+                    # Similar a media-col-default pero indica papel físicamente presente
+                    # Enviar colección básica
+                    response.write(bytes([0x34]))  # begCollection tag
+                    response.write((0).to_bytes(2, 'big'))
+                    response.write((0).to_bytes(2, 'big'))
+                    
+                    # media-size
+                    response.write(bytes([0x4a]))  # memberAttrName
+                    name_bytes = b'media-size'
+                    response.write(len(name_bytes).to_bytes(2, 'big'))
+                    response.write(name_bytes)
+                    response.write((0).to_bytes(2, 'big'))
+                    
+                    # Sub-colección media-size
+                    response.write(bytes([0x34]))  # begCollection
+                    response.write((0).to_bytes(2, 'big'))
+                    response.write((0).to_bytes(2, 'big'))
+                    
+                    # x-dimension (58mm)
+                    response.write(bytes([0x4a]))  # memberAttrName
+                    response.write((11).to_bytes(2, 'big'))
+                    response.write(b'x-dimension')
+                    response.write((0).to_bytes(2, 'big'))
+                    response.write(bytes([0x21]))  # integer
+                    response.write((0).to_bytes(2, 'big'))
+                    response.write((4).to_bytes(2, 'big'))
+                    response.write((5800).to_bytes(4, 'big'))
+                    
+                    # y-dimension (continuo)
+                    response.write(bytes([0x4a]))  # memberAttrName
+                    response.write((11).to_bytes(2, 'big'))
+                    response.write(b'y-dimension')
+                    response.write((0).to_bytes(2, 'big'))
+                    response.write(bytes([0x21]))  # integer
+                    response.write((0).to_bytes(2, 'big'))
+                    response.write((4).to_bytes(2, 'big'))
+                    response.write((30000).to_bytes(4, 'big'))
+                    
+                    # Cerrar sub-colección
+                    response.write(bytes([0x37]))  # endCollection
+                    response.write((0).to_bytes(2, 'big'))
+                    response.write((0).to_bytes(2, 'big'))
+                    
+                    # Cerrar colección principal
+                    response.write(bytes([0x37]))  # endCollection
+                    response.write((0).to_bytes(2, 'big'))
+                    response.write((0).to_bytes(2, 'big'))
+                
+                elif attr_name == 'printer-resolution-default':
+                    # Resolución por defecto: 203 DPI (thermal printer standard)
+                    # Formato: x-resolution, y-resolution, units (3=dots per inch)
+                    resolution = (203).to_bytes(4, 'big') + (203).to_bytes(4, 'big') + (3).to_bytes(1, 'big')
+                    self._write_attribute(response, 0x32, 'printer-resolution-default', resolution)
+                
+                elif attr_name == 'printer-resolution-supported':
+                    # Resolución soportada
+                    resolution = (203).to_bytes(4, 'big') + (203).to_bytes(4, 'big') + (3).to_bytes(1, 'big')
+                    self._write_attribute(response, 0x32, 'printer-resolution-supported', resolution)
+                
+                elif attr_name == 'print-quality-default':
+                    # Calidad de impresión por defecto: 4=normal
+                    self._write_attribute(response, 0x23, 'print-quality-default', (4).to_bytes(4, 'big'))
+                
+                elif attr_name == 'print-quality-supported':
+                    # Calidades soportadas: 3=draft, 4=normal, 5=high
+                    for quality in [3, 4, 5]:
+                        self._write_attribute(response, 0x23, 'print-quality-supported', quality.to_bytes(4, 'big'))
+                
+                elif attr_name == 'pwg-raster-document-resolution-supported':
+                    # Resoluciones PWG Raster soportadas
+                    resolution = (203).to_bytes(4, 'big') + (203).to_bytes(4, 'big') + (3).to_bytes(1, 'big')
+                    self._write_attribute(response, 0x32, 'pwg-raster-document-resolution-supported', resolution)
+                
+                elif attr_name == 'pwg-raster-document-type-supported':
+                    # Tipos de documento PWG Raster: black_1 (1-bit black), sgray_8 (8-bit grayscale)
+                    for doc_type in ['black_1', 'sgray_8']:
+                        self._write_attribute(response, 0x44, 'pwg-raster-document-type-supported', doc_type)
+                
+                elif attr_name == 'finishings-default':
+                    # Acabados por defecto: 3=none
+                    self._write_attribute(response, 0x23, 'finishings-default', (3).to_bytes(4, 'big'))
+                
+                elif attr_name == 'finishings-supported':
+                    # Acabados soportados: 3=none
+                    self._write_attribute(response, 0x23, 'finishings-supported', (3).to_bytes(4, 'big'))
+                
+                elif attr_name == 'job-password-supported':
+                    # Longitud máxima de contraseña para trabajos: 0=no soportado
+                    self._write_attribute(response, 0x21, 'job-password-supported', (0).to_bytes(4, 'big'))
+                
+                elif attr_name == 'media-source-default':
+                    # Fuente de papel por defecto
+                    self._write_attribute(response, 0x44, 'media-source-default', 'auto')
+                
+                elif attr_name == 'media-source-supported':
+                    # Fuentes de papel soportadas
+                    for source in ['auto', 'main', 'manual']:
+                        self._write_attribute(response, 0x44, 'media-source-supported', source)
+                
+                elif attr_name == 'multiple-document-handling-default':
+                    # Manejo de múltiples documentos por defecto
+                    self._write_attribute(response, 0x44, 'multiple-document-handling-default', 'separate-documents-uncollated-copies')
+                
+                elif attr_name == 'client-info-supported':
+                    # Información del cliente soportada (IPP Everywhere)
+                    for info in ['client-name', 'client-version']:
+                        self._write_attribute(response, 0x44, 'client-info-supported', info)
+                
+                elif attr_name == 'document-format-details-supported':
+                    # Detalles de formato de documento soportados
+                    for detail in ['document-format', 'document-format-version']:
+                        self._write_attribute(response, 0x44, 'document-format-details-supported', detail)
+                
+                elif attr_name == 'mopria-certified':
+                    # Certificación Mopria (para impresión móvil)
+                    # Versión 1.3 es común, pero puedes ajustar según necesites
+                    self._write_attribute(response, 0x41, 'mopria-certified', '1.3')
+                
+                elif attr_name == 'mopria_certified':
+                    # Variante con guión bajo (algunos clientes lo solicitan así)
+                    self._write_attribute(response, 0x41, 'mopria_certified', '1.3')
+                
+                elif attr_name == 'printer-firmware-name':
+                    # Nombre del firmware
+                    self._write_attribute(response, 0x41, 'printer-firmware-name', 'ONE-POS-Firmware')
+                
+                elif attr_name == 'printer-firmware-string-version':
+                    # Versión del firmware en formato string
+                    self._write_attribute(response, 0x41, 'printer-firmware-string-version', '1.0.0')
+                
+                elif attr_name == 'printer-strings-languages-supported':
+                    # Idiomas soportados para strings de la impresora
+                    for lang in ['en', 'es', 'en-us', 'es-es']:
+                        self._write_attribute(response, 0x48, 'printer-strings-languages-supported', lang)
+                
+                # ===== ATRIBUTOS ADICIONALES WINDOWS/CUPS AVANZADOS =====
+                
+                elif attr_name == 'number-up-supported':
+                    # N-up soportado (páginas por hoja) - solo 1 para impresora térmica
+                    self._write_attribute(response, 0x21, 'number-up-supported', (1).to_bytes(4, 'big'))
+                
+                elif attr_name == 'output-bin-default':
+                    # Bandeja de salida por defecto
+                    self._write_attribute(response, 0x44, 'output-bin-default', 'face-up')
+                
+                elif attr_name == 'output-bin-supported':
+                    # Bandejas de salida soportadas
+                    self._write_attribute(response, 0x44, 'output-bin-supported', 'face-up')
+                
+                elif attr_name == 'orientation-requested-default':
+                    # Orientación por defecto: 3=portrait
+                    self._write_attribute(response, 0x23, 'orientation-requested-default', (3).to_bytes(4, 'big'))
+                
+                elif attr_name == 'sides-default':
+                    # Impresión por defecto: one-sided (térmica no tiene duplex)
+                    self._write_attribute(response, 0x44, 'sides-default', 'one-sided')
+                
+                elif attr_name == 'sides-supported':
+                    # Lados soportados
+                    self._write_attribute(response, 0x44, 'sides-supported', 'one-sided')
+                
+                elif attr_name == 'print-color-mode-default':
+                    # Modo de color por defecto: monochrome (térmica es B&W)
+                    self._write_attribute(response, 0x44, 'print-color-mode-default', 'monochrome')
+                
+                elif attr_name == 'print-color-mode-supported':
+                    # Modos de color soportados
+                    self._write_attribute(response, 0x44, 'print-color-mode-supported', 'monochrome')
+                
+                elif attr_name == 'pages-per-minute':
+                    # Páginas por minuto (estimado para térmica: ~10 ppm)
+                    self._write_attribute(response, 0x21, 'pages-per-minute', (10).to_bytes(4, 'big'))
+                
+                elif attr_name == 'pages-per-minute-color':
+                    # PPM color: 0 (no soporta color)
+                    self._write_attribute(response, 0x21, 'pages-per-minute-color', (0).to_bytes(4, 'big'))
+                
+                elif attr_name == 'printer-output-tray':
+                    # Información de bandeja de salida
+                    # Format: "process-option=value;process-option=value"
+                    self._write_attribute(response, 0x41, 'printer-output-tray', 'type=unRemovableBin;maxcapacity=-1;remaining=-1;status=0;name=top')
+                
+                # ===== ATRIBUTOS PCLm (HP PCL mobile) =====
+                
+                elif attr_name == 'pclm-raster-back-side':
+                    # Lado trasero para PCLm (not applicable for thermal)
+                    self._write_attribute(response, 0x44, 'pclm-raster-back-side', 'normal')
+                
+                elif attr_name == 'pclm-source-resolution-supported':
+                    # Resoluciones PCLm soportadas
+                    # Format: resolution (xres, yres, units)
+                    resolution = (203).to_bytes(4, 'big') + (203).to_bytes(4, 'big') + (3).to_bytes(1, 'big')
+                    self._write_attribute(response, 0x32, 'pclm-source-resolution-supported', resolution)
+                
+                # ===== ATRIBUTOS PDF =====
+                
+                elif attr_name == 'pdf-fit-to-page-default':
+                    # Ajustar PDF a página por defecto: false
+                    self._write_attribute(response, 0x22, 'pdf-fit-to-page-default', (0).to_bytes(1, 'big'))
+                
+                elif attr_name == 'pdf-fit-to-page-supported':
+                    # Ajustar PDF a página soportado: true y false
+                    self._write_attribute(response, 0x22, 'pdf-fit-to-page-supported', (1).to_bytes(1, 'big'))
+                    self._write_attribute(response, 0x22, 'pdf-fit-to-page-supported', (0).to_bytes(1, 'big'))
+                
+                # ===== ATRIBUTOS PRESENTACIÓN Y ESCALADO =====
+                
+                elif attr_name == 'presentation-direction-number-up-default':
+                    # Dirección de presentación para N-up: toright-tobottom
+                    self._write_attribute(response, 0x44, 'presentation-direction-number-up-default', 'toright-tobottom')
+                
+                elif attr_name == 'presentation-direction-number-up-supported':
+                    # Direcciones soportadas
+                    for direction in ['toright-tobottom', 'tobottom-toright']:
+                        self._write_attribute(response, 0x44, 'presentation-direction-number-up-supported', direction)
+                
+                elif attr_name == 'print-scaling-default':
+                    # Escalado por defecto: auto
+                    self._write_attribute(response, 0x44, 'print-scaling-default', 'auto')
+                
+                elif attr_name == 'print-scaling-supported':
+                    # Escalados soportados
+                    for scaling in ['auto', 'fill', 'fit', 'none']:
+                        self._write_attribute(response, 0x44, 'print-scaling-supported', scaling)
+                
+                # ===== ATRIBUTOS PWG RASTER AVANZADOS =====
+                
+                elif attr_name == 'pwg-raster-document-sheet-back':
+                    # Configuración de hoja trasera PWG (not applicable - one-sided)
+                    self._write_attribute(response, 0x44, 'pwg-raster-document-sheet-back', 'normal')
+                
+                # ===== ATRIBUTOS CRÍTICOS PARA WINDOWS PRINT-JOB =====
+                
+                elif attr_name == 'pdl-override-supported':
+                    # CRÍTICO: Indica si el servidor puede sobreescribir PDL (Page Description Language)
+                    # Windows necesita esto para saber si puede enviar el formato preferido
+                    self._write_attribute(response, 0x44, 'pdl-override-supported', 'attempted')
+                
+                elif attr_name == 'ipp-features-supported':
+                    # Características IPP soportadas (IPP Everywhere)
+                    for feature in ['ipp-everywhere', 'airprint-1.4', 'document-object']:
+                        self._write_attribute(response, 0x44, 'ipp-features-supported', feature)
+                
+                elif attr_name == 'job-creation-attributes-supported':
+                    # Atributos soportados al crear trabajos
+                    for attr in ['copies', 'media', 'sides', 'print-quality', 'print-color-mode', 
+                                'orientation-requested', 'printer-resolution']:
+                        self._write_attribute(response, 0x44, 'job-creation-attributes-supported', attr)
+                
+                elif attr_name == 'printer-settable-attributes-supported':
+                    # Atributos que el cliente puede modificar
+                    for attr in ['printer-location', 'printer-info']:
+                        self._write_attribute(response, 0x44, 'printer-settable-attributes-supported', attr)
+                
+                elif attr_name == 'document-charset-default':
+                    # Charset por defecto para documentos
+                    self._write_attribute(response, 0x47, 'document-charset-default', 'utf-8')
+                
+                elif attr_name == 'document-charset-supported':
+                    # Charsets soportados
+                    for charset in ['utf-8', 'us-ascii', 'iso-8859-1']:
+                        self._write_attribute(response, 0x47, 'document-charset-supported', charset)
+                
+                elif attr_name == 'document-natural-language-default':
+                    # Idioma natural por defecto
+                    self._write_attribute(response, 0x48, 'document-natural-language-default', 'es')
+                
+                elif attr_name == 'document-natural-language-supported':
+                    # Idiomas naturales soportados
+                    for lang in ['en', 'es', 'en-us', 'es-cl']:
+                        self._write_attribute(response, 0x48, 'document-natural-language-supported', lang)
+                
+                elif attr_name == 'generated-natural-language-supported':
+                    # Idiomas para mensajes generados
+                    for lang in ['en', 'es']:
+                        self._write_attribute(response, 0x48, 'generated-natural-language-supported', lang)
+                
+                elif attr_name == 'which-jobs-supported':
+                    # Qué trabajos se pueden consultar
+                    for which in ['completed', 'not-completed', 'all']:
+                        self._write_attribute(response, 0x44, 'which-jobs-supported', which)
+                
+                elif attr_name == 'job-ids-supported':
+                    # Indica si soporta job-ids
+                    self._write_attribute(response, 0x22, 'job-ids-supported', (1).to_bytes(1, 'big'))
+                
+                elif attr_name == 'job-k-octets-supported':
+                    # Tamaño máximo de trabajo en kilobytes
+                    # 0 = sin límite, pero especificamos 100MB = 102400 KB
+                    self._write_attribute(response, 0x33, 'job-k-octets-supported', 
+                                        (0).to_bytes(4, 'big') + (102400).to_bytes(4, 'big'))
+                
+                elif attr_name == 'job-priority-default':
+                    # Prioridad por defecto (50 = normal)
+                    self._write_attribute(response, 0x21, 'job-priority-default', (50).to_bytes(4, 'big'))
+                
+                elif attr_name == 'job-priority-supported':
+                    # Prioridad soportada (1-100)
+                    self._write_attribute(response, 0x21, 'job-priority-supported', (100).to_bytes(4, 'big'))
+                
+                elif attr_name == 'job-hold-until-default':
+                    # Retención de trabajo por defecto
+                    self._write_attribute(response, 0x44, 'job-hold-until-default', 'no-hold')
+                
+                elif attr_name == 'job-hold-until-supported':
+                    # Opciones de retención
+                    for hold in ['no-hold', 'indefinite']:
+                        self._write_attribute(response, 0x44, 'job-hold-until-supported', hold)
+                
+                elif attr_name == 'charset-configured':
+                    # Charset configurado (ya implementado arriba, pero por si acaso)
+                    self._write_attribute(response, 0x47, 'charset-configured', 'utf-8')
+                
+                # ========== ATRIBUTOS ADICIONALES ANDROID ==========
+                elif attr_name == 'epcl-version-supported':
+                    # EPCL (Embedded Printing Command Language) - Samsung/HP printers
+                    # No soportamos EPCL específicamente, enviar vacío o versión genérica
+                    self._write_attribute(response, 0x44, 'epcl-version-supported', '1.0')
+                
+                elif attr_name == 'pclm-strip-height-preferred':
+                    # PCLm strip height preferido en líneas (típico: 16-256)
+                    # Para impresoras térmicas pequeñas, usar strips más pequeños
+                    self._write_attribute(response, 0x21, 'pclm-strip-height-preferred', (16).to_bytes(4, 'big'))
+                
+                elif attr_name == 'pclm-compression-method-preferred':
+                    # Método de compresión PCLm preferido
+                    # Opciones: 'flate' (deflate/zip), 'rle' (run-length), 'jpeg'
+                    self._write_attribute(response, 0x44, 'pclm-compression-method-preferred', 'flate')
+                
+                elif attr_name == 'media-ready':
+                    # Papel actualmente cargado y listo para imprimir
+                    # Para impresoras de rollo continuo, indicar el tamaño configurado
+                    self._write_attribute(response, 0x44, 'media-ready', 'oe_roll_58mm')
+                
                 else:
                     logger.debug(f"⚠️ Requested attribute '{attr_name}' not implemented")
             
@@ -2057,6 +2479,237 @@ class IPPServer:
             response.write(bytes([0x37]))  # endCollection
             response.write((0).to_bytes(2, 'big'))
             response.write((0).to_bytes(2, 'big'))
+            
+            # ========== ATRIBUTOS AVANZADOS (MODO COMPLETO) ==========
+            
+            # copies-default
+            self._write_attribute(response, 0x21, 'copies-default', (1).to_bytes(4, 'big'))
+            
+            # orientation-requested-supported
+            for orientation in [3, 4]:  # 3=portrait, 4=landscape
+                self._write_attribute(response, 0x23, 'orientation-requested-supported', orientation.to_bytes(4, 'big'))
+            
+            # job-impressions-supported
+            self._write_attribute(response, 0x33, 'job-impressions-supported', 
+                                (1).to_bytes(4, 'big') + (9999).to_bytes(4, 'big'))
+            
+            # job-pages-per-set-supported
+            self._write_attribute(response, 0x33, 'job-pages-per-set-supported', 
+                                (1).to_bytes(4, 'big') + (9999).to_bytes(4, 'big'))
+            
+            # media-type-supported
+            for media_type in ['stationery', 'continuous', 'labels']:
+                self._write_attribute(response, 0x44, 'media-type-supported', media_type)
+            
+            # printer-resolution-default
+            resolution = (203).to_bytes(4, 'big') + (203).to_bytes(4, 'big') + (3).to_bytes(1, 'big')
+            self._write_attribute(response, 0x32, 'printer-resolution-default', resolution)
+            
+            # printer-resolution-supported
+            resolution = (203).to_bytes(4, 'big') + (203).to_bytes(4, 'big') + (3).to_bytes(1, 'big')
+            self._write_attribute(response, 0x32, 'printer-resolution-supported', resolution)
+            
+            # print-quality-default
+            self._write_attribute(response, 0x23, 'print-quality-default', (4).to_bytes(4, 'big'))
+            
+            # print-quality-supported
+            for quality in [3, 4, 5]:
+                self._write_attribute(response, 0x23, 'print-quality-supported', quality.to_bytes(4, 'big'))
+            
+            # pwg-raster-document-resolution-supported
+            resolution = (203).to_bytes(4, 'big') + (203).to_bytes(4, 'big') + (3).to_bytes(1, 'big')
+            self._write_attribute(response, 0x32, 'pwg-raster-document-resolution-supported', resolution)
+            
+            # pwg-raster-document-type-supported
+            for doc_type in ['black_1', 'sgray_8']:
+                self._write_attribute(response, 0x44, 'pwg-raster-document-type-supported', doc_type)
+            
+            # finishings-default
+            self._write_attribute(response, 0x23, 'finishings-default', (3).to_bytes(4, 'big'))
+            
+            # finishings-supported
+            self._write_attribute(response, 0x23, 'finishings-supported', (3).to_bytes(4, 'big'))
+            
+            # job-password-supported
+            self._write_attribute(response, 0x21, 'job-password-supported', (0).to_bytes(4, 'big'))
+            
+            # media-source-default
+            self._write_attribute(response, 0x44, 'media-source-default', 'auto')
+            
+            # media-source-supported
+            for source in ['auto', 'main', 'manual']:
+                self._write_attribute(response, 0x44, 'media-source-supported', source)
+            
+            # multiple-document-handling-default
+            self._write_attribute(response, 0x44, 'multiple-document-handling-default', 
+                                'separate-documents-uncollated-copies')
+            
+            # client-info-supported
+            for info in ['client-name', 'client-version']:
+                self._write_attribute(response, 0x44, 'client-info-supported', info)
+            
+            # document-format-details-supported
+            for detail in ['document-format', 'document-format-version']:
+                self._write_attribute(response, 0x44, 'document-format-details-supported', detail)
+            
+            # mopria-certified
+            self._write_attribute(response, 0x41, 'mopria-certified', '1.3')
+            
+            # printer-firmware-name
+            self._write_attribute(response, 0x41, 'printer-firmware-name', 'ONE-POS-Firmware')
+            
+            # printer-firmware-string-version
+            self._write_attribute(response, 0x41, 'printer-firmware-string-version', '1.0.0')
+            
+            # printer-strings-languages-supported
+            for lang in ['en', 'es', 'en-us', 'es-es']:
+                self._write_attribute(response, 0x48, 'printer-strings-languages-supported', lang)
+            
+            # media-size-supported
+            self._write_attribute(response, 0x44, 'media-size-supported', '58xvariable')
+            
+            # media-left-margin-supported
+            self._write_attribute(response, 0x21, 'media-left-margin-supported', (0).to_bytes(4, 'big'))
+            
+            # media-right-margin-supported
+            self._write_attribute(response, 0x21, 'media-right-margin-supported', (0).to_bytes(4, 'big'))
+            
+            # media-bottom-margin-supported
+            self._write_attribute(response, 0x21, 'media-bottom-margin-supported', (0).to_bytes(4, 'big'))
+            
+            # media-top-margin-supported
+            self._write_attribute(response, 0x21, 'media-top-margin-supported', (0).to_bytes(4, 'big'))
+            
+            # media-col-default
+            self._write_attribute(response, 0x44, 'media-col-default', 'media-size=58xvariable;media-type=continuous;media-source=main')
+            
+            # number-up-default
+            self._write_attribute(response, 0x21, 'number-up-default', (1).to_bytes(4, 'big'))
+            
+            # number-up-supported
+            self._write_attribute(response, 0x33, 'number-up-supported', 
+                                (1).to_bytes(4, 'big') + (1).to_bytes(4, 'big'))
+            
+            # ========== ATRIBUTOS ADICIONALES AVANZADOS ==========
+            
+            # output-bin-default
+            self._write_attribute(response, 0x44, 'output-bin-default', 'face-up')
+            
+            # output-bin-supported
+            self._write_attribute(response, 0x44, 'output-bin-supported', 'face-up')
+            
+            # orientation-requested-default
+            self._write_attribute(response, 0x23, 'orientation-requested-default', (3).to_bytes(4, 'big'))
+            
+            # sides-default
+            self._write_attribute(response, 0x44, 'sides-default', 'one-sided')
+            
+            # sides-supported
+            self._write_attribute(response, 0x44, 'sides-supported', 'one-sided')
+            
+            # print-color-mode-default
+            self._write_attribute(response, 0x44, 'print-color-mode-default', 'monochrome')
+            
+            # pages-per-minute
+            self._write_attribute(response, 0x21, 'pages-per-minute', (10).to_bytes(4, 'big'))
+            
+            # pages-per-minute-color
+            self._write_attribute(response, 0x21, 'pages-per-minute-color', (0).to_bytes(4, 'big'))
+            
+            # printer-output-tray
+            self._write_attribute(response, 0x41, 'printer-output-tray', 
+                                'type=unRemovableBin;maxcapacity=-1;remaining=-1;status=0;name=top')
+            
+            # pclm-raster-back-side
+            self._write_attribute(response, 0x44, 'pclm-raster-back-side', 'normal')
+            
+            # pclm-source-resolution-supported
+            resolution = (203).to_bytes(4, 'big') + (203).to_bytes(4, 'big') + (3).to_bytes(1, 'big')
+            self._write_attribute(response, 0x32, 'pclm-source-resolution-supported', resolution)
+            
+            # pdf-fit-to-page-default
+            self._write_attribute(response, 0x22, 'pdf-fit-to-page-default', (0).to_bytes(1, 'big'))
+            
+            # pdf-fit-to-page-supported
+            self._write_attribute(response, 0x22, 'pdf-fit-to-page-supported', (1).to_bytes(1, 'big'))
+            self._write_attribute(response, 0x22, 'pdf-fit-to-page-supported', (0).to_bytes(1, 'big'))
+            
+            # presentation-direction-number-up-default
+            self._write_attribute(response, 0x44, 'presentation-direction-number-up-default', 'toright-tobottom')
+            
+            # presentation-direction-number-up-supported
+            for direction in ['toright-tobottom', 'tobottom-toright']:
+                self._write_attribute(response, 0x44, 'presentation-direction-number-up-supported', direction)
+            
+            # print-scaling-default
+            self._write_attribute(response, 0x44, 'print-scaling-default', 'auto')
+            
+            # print-scaling-supported
+            for scaling in ['auto', 'fill', 'fit', 'none']:
+                self._write_attribute(response, 0x44, 'print-scaling-supported', scaling)
+            
+            # pwg-raster-document-sheet-back
+            self._write_attribute(response, 0x44, 'pwg-raster-document-sheet-back', 'normal')
+            
+            # ========== ATRIBUTOS CRÍTICOS PARA WINDOWS ==========
+            
+            # pdl-override-supported (CRÍTICO para Windows)
+            self._write_attribute(response, 0x44, 'pdl-override-supported', 'attempted')
+            
+            # ipp-features-supported
+            for feature in ['ipp-everywhere', 'airprint-1.4']:
+                self._write_attribute(response, 0x44, 'ipp-features-supported', feature)
+            
+            # job-creation-attributes-supported
+            for attr in ['copies', 'media', 'sides', 'print-quality', 'print-color-mode']:
+                self._write_attribute(response, 0x44, 'job-creation-attributes-supported', attr)
+            
+            # which-jobs-supported
+            for which in ['completed', 'not-completed', 'all']:
+                self._write_attribute(response, 0x44, 'which-jobs-supported', which)
+            
+            # job-ids-supported
+            self._write_attribute(response, 0x22, 'job-ids-supported', (1).to_bytes(1, 'big'))
+            
+            # job-k-octets-supported (0-100MB)
+            self._write_attribute(response, 0x33, 'job-k-octets-supported', 
+                                (0).to_bytes(4, 'big') + (102400).to_bytes(4, 'big'))
+            
+            # job-priority-default y supported
+            self._write_attribute(response, 0x21, 'job-priority-default', (50).to_bytes(4, 'big'))
+            self._write_attribute(response, 0x21, 'job-priority-supported', (100).to_bytes(4, 'big'))
+            
+            # job-hold-until
+            self._write_attribute(response, 0x44, 'job-hold-until-default', 'no-hold')
+            for hold in ['no-hold', 'indefinite']:
+                self._write_attribute(response, 0x44, 'job-hold-until-supported', hold)
+            
+            # document charsets
+            self._write_attribute(response, 0x47, 'document-charset-default', 'utf-8')
+            for charset in ['utf-8', 'us-ascii', 'iso-8859-1']:
+                self._write_attribute(response, 0x47, 'document-charset-supported', charset)
+            
+            # document languages
+            self._write_attribute(response, 0x48, 'document-natural-language-default', 'es')
+            for lang in ['en', 'es', 'en-us', 'es-cl']:
+                self._write_attribute(response, 0x48, 'document-natural-language-supported', lang)
+            
+            # generated languages
+            for lang in ['en', 'es']:
+                self._write_attribute(response, 0x48, 'generated-natural-language-supported', lang)
+            
+            # ========== ATRIBUTOS ADICIONALES ANDROID ==========
+            # epcl-version-supported (Embedded Printing Command Language)
+            self._write_attribute(response, 0x44, 'epcl-version-supported', '1.0')
+            
+            # pclm-strip-height-preferred (PCLm strip height en líneas)
+            self._write_attribute(response, 0x21, 'pclm-strip-height-preferred', (16).to_bytes(4, 'big'))
+            
+            # pclm-compression-method-preferred (método de compresión PCLm)
+            self._write_attribute(response, 0x44, 'pclm-compression-method-preferred', 'flate')
+            
+            # media-ready (papel actualmente cargado)
+            self._write_attribute(response, 0x44, 'media-ready', 'oe_roll_58mm')
             
             # End of attributes
             response.write(bytes([0x03]))
