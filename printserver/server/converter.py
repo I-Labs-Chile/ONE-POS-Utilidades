@@ -32,13 +32,16 @@ class ConversionError(Exception):
 
 class DocumentConverter:
     """
-    Converter de documentos a formato ESC/POS para impresoras térmicas de 58mm
+    Converter INTERNO de documentos a formato nativo de impresora
     
-    Flujo de conversión:
-    1. Recibe documento en formato original (PDF, imagen, etc.)
+    IMPORTANTE: Este conversor trabaja de forma transparente. Los clientes envían
+    documentos estándar (PDF, imágenes) sin saber que se convierten a ESC/POS.
+    
+    Flujo de conversión (transparente para el cliente):
+    1. Recibe documento en formato estándar (PDF, imagen, etc.)
     2. Convierte a imagen bitmap monocromática
-    3. Optimiza para impresora térmica (contraste, dithering)
-    4. Genera comandos ESC/POS para imprimir
+    3. Optimiza para impresión de alta calidad (contraste, dithering)
+    4. Genera comandos nativos para la impresora (ESC/POS internamente)
     """
 
     def __init__(self):
@@ -283,12 +286,12 @@ class DocumentConverter:
     
     def _prepare_image_for_thermal(self, image: Image.Image) -> Image.Image:
         """
-        Prepara imagen para impresora térmica de 58mm
+        Prepara imagen para impresión de alta calidad
         
-        Proceso:
+        Proceso de optimización:
         1. Convierte a RGB si es necesario
         2. Escala a ancho de impresora (384px) manteniendo aspecto
-        3. Mejora contraste y nitidez para mejor impresión
+        3. Mejora contraste y nitidez para mejor calidad de impresión
         4. Convierte a escala de grises
         5. Aplica dithering Floyd-Steinberg para convertir a 1-bit (B&N)
         """
@@ -320,8 +323,8 @@ class DocumentConverter:
         if image.mode != 'L':
             image = image.convert('L')
         
-        # MEJORA 1: Aumentar contraste para impresión térmica
-        # Las impresoras térmicas necesitan mayor contraste
+        # MEJORA 1: Aumentar contraste para impresión de alta calidad
+        # Las impresoras monocromáticas necesitan mayor contraste
         enhancer = ImageEnhance.Contrast(image)
         image = enhancer.enhance(1.8)  # Aumentar contraste 80%
         logger.debug("Applied contrast enhancement: 1.8x")
@@ -339,7 +342,7 @@ class DocumentConverter:
         # MEJORA 4: Aplicar dithering Floyd-Steinberg para convertir a 1-bit
         # Esto distribuye el error de cuantización para mejor calidad visual
         image = image.convert('1', dither=Image.Dither.FLOYDSTEINBERG)
-        logger.info(f"Image prepared for thermal printing: {image.size[0]}x{image.size[1]} pixels, 1-bit B&W")
+        logger.info(f"Image prepared for printing: {image.size[0]}x{image.size[1]} pixels, 1-bit B&W")
         
         return image
     
@@ -385,12 +388,15 @@ class DocumentConverter:
     
     def _bitmap_to_escpos(self, image: Image.Image) -> bytes:
         """
-        Convierte imagen bitmap a comandos ESC/POS
+        Convierte imagen bitmap a comandos nativos de impresora (ESC/POS)
         
-        Usa el método ESC * 33 (24-dot double-density) que es el más compatible
-        con impresoras térmicas. Procesa la imagen en franjas de 24 píxeles de alto.
+        NOTA INTERNA: Este método genera comandos ESC/POS, pero el cliente
+        no necesita saber esto. Para el cliente es una "impresora genérica".
         
-        Formato ESC/POS:
+        Usa el método ESC * 33 (24-dot double-density) por alta compatibilidad.
+        Procesa la imagen en franjas de 24 píxeles de alto.
+        
+        Formato de comandos:
         - ESC @ : Inicializar impresora
         - ESC 3 n : Establecer espaciado de línea
         - ESC a n : Alineación (0=izq, 1=centro, 2=der)

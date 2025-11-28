@@ -7,16 +7,17 @@ class PrintServerSettings:
     SERVER_HOST = os.getenv('PRINTSERVER_HOST', '0.0.0.0')
     SERVER_PORT = int(os.getenv('PRINTSERVER_PORT', 631))  # Puerto estándar IPP
     
-    # Printer configuration
-    PRINTER_NAME = os.getenv('PRINTER_NAME', 'Thermal-Printer')
-    PRINTER_INFO = os.getenv('PRINTER_INFO', 'IPP Thermal Printer')
+    # Printer configuration - Presentar como impresora genérica estándar
+    PRINTER_NAME = os.getenv('PRINTER_NAME', 'ONE-POS-Printer')
+    PRINTER_INFO = os.getenv('PRINTER_INFO', 'ONE POS Network Printer')
     PRINTER_LOCATION = os.getenv('PRINTER_LOCATION', 'Office')
-    PRINTER_MAKE_MODEL = os.getenv('PRINTER_MAKE_MODEL', 'Generic Thermal ESC/POS Printer')
+    PRINTER_MAKE_MODEL = os.getenv('PRINTER_MAKE_MODEL', 'Generic IPP Network Printer')
     
-    # Thermal printer specific settings - OPTIMIZADO PARA 58MM
-    PRINTER_WIDTH_MM = int(os.getenv('PRINTER_WIDTH_MM', 58))  # ✅ 58mm por defecto
-    PRINTER_MAX_PIXELS = int(os.getenv('PRINTER_MAX_PIXELS', 384))  # ✅ 58mm @ 203 DPI
-    PRINTER_DPI = int(os.getenv('PRINTER_DPI', 203))
+    # Printer physical settings - Configuración interna (no expuesta a clientes)
+    # El cliente ve una impresora genérica, nosotros manejamos la conversión
+    PRINTER_WIDTH_MM = int(os.getenv('PRINTER_WIDTH_MM', 58))  # Ancho real: 58mm
+    PRINTER_MAX_PIXELS = int(os.getenv('PRINTER_MAX_PIXELS', 384))  # 58mm @ 203 DPI
+    PRINTER_DPI = int(os.getenv('PRINTER_DPI', 203))  # Resolución interna
 
     # USB configuration
     USB_VENDOR_ID = os.getenv('USB_VENDOR_ID', None)  # Auto-detect if None
@@ -32,14 +33,16 @@ class PrintServerSettings:
     MDNS_SERVICE_NAME = PRINTER_NAME
     MDNS_DOMAIN = "local."
     
-    # Supported formats
+    # Supported formats - Formatos estándar que acepta cualquier impresora
+    # El servidor convierte automáticamente a ESC/POS internamente
     SUPPORTED_FORMATS = [
-        "application/pdf",
-        "image/pwg-raster", 
-        "image/jpeg",
-        "image/png",
-        "text/plain",
-        "application/octet-stream"
+        "application/pdf",          # Documentos PDF estándar
+        "image/jpeg",               # Imágenes JPEG
+        "image/png",                # Imágenes PNG
+        "image/pwg-raster",         # PWG Raster (AirPrint/CUPS)
+        "text/plain",               # Texto plano
+        "application/vnd.escpos",   # ESC/POS directo (clientes avanzados, uso interno)
+        "application/octet-stream"  # Binario genérico (auto-detect)
     ]
     
     # Supported operations
@@ -50,7 +53,8 @@ class PrintServerSettings:
         "Get-Jobs"
     ]
     
-    # Printer attributes
+    # Printer attributes - Presentar como impresora genérica estándar
+    # NO mencionar "thermal" ni ESC/POS en atributos públicos
     PRINTER_ATTRIBUTES = {
         'charset-supported': ['utf-8'],
         'compression-supported': ['none', 'deflate'],
@@ -61,34 +65,36 @@ class PrintServerSettings:
         'printer-make-and-model': PRINTER_MAKE_MODEL,
         'printer-state': 'idle',  # idle, processing, stopped
         'operations-supported': SUPPORTED_OPERATIONS,
-        'color-supported': False,
-        'media-supported': ['roll'],
-        'printer-kind': ['thermal'],
+        'color-supported': False,  # Monocromático (común en muchas impresoras)
+        'media-supported': ['na_index-3x5_3x5in', 'custom_min_57.91x101.6mm', 'custom_max_57.91x3048mm'],  # Tamaños genéricos
+        'printer-kind': ['document'],  # Impresora de documentos genérica
         'sides-supported': ['one-sided'],
         'print-quality-supported': [3, 4, 5],  # draft, normal, high
-        'printer-resolution-supported': [(PRINTER_DPI, PRINTER_DPI, 'dpi')],
+        'printer-resolution-supported': [(203, 203, 'dpi'), (300, 300, 'dpi')],  # Resoluciones comunes
         'media-size-supported': [
             {
-                'x-dimension': PRINTER_WIDTH_MM * 100,  # Convert to hundredths of mm
-                'y-dimension': 32767  # Maximum for continuous roll
+                'x-dimension': PRINTER_WIDTH_MM * 100,  # Ancho en centésimas de mm
+                'y-dimension': 32767  # Longitud máxima para papel continuo
             }
         ]
     }
     
     # mDNS TXT record attributes for AirPrint/IPP
+    # Anunciar como impresora genérica, NO mencionar "thermal"
+    # NOTA: No incluimos application/vnd.escpos en pdl para mantener apariencia genérica
     MDNS_TXT_RECORDS = {
         'txtvers': '1',
         'qtotal': '1',
         'rp': f'ipp/printer',
-        'ty': PRINTER_MAKE_MODEL,
+        'ty': PRINTER_MAKE_MODEL,  # "Generic IPP Network Printer"
         'adminurl': f'http://{SERVER_HOST}:{SERVER_PORT}/',
         'note': PRINTER_INFO,
         'priority': '0',
         'product': f'({PRINTER_MAKE_MODEL})',
-        'pdl': 'application/pdf,image/pwg-raster,image/jpeg,image/png',
-        'URF': 'W8,SRGB24,CP1,RS300',  # AirPrint URF capabilities
-        'Color': 'F',  # Monochrome printer
-        'Duplex': 'F',  # No duplex
+        'pdl': 'application/pdf,image/pwg-raster,image/jpeg,image/png',  # Solo formatos públicos
+        'URF': 'W8,SRGB24,CP1,RS300',  # AirPrint URF capabilities estándar
+        'Color': 'F',  # Monochrome printer (común)
+        'Duplex': 'F',  # No duplex (común)
         'Bind': 'F',
         'Sort': 'F',
         'Collate': 'F',
@@ -175,10 +181,10 @@ class PrintServerSettings:
             errors.append("SERVER_PORT must be between 1 and 65535")
         
         if cls.PRINTER_WIDTH_MM not in [58, 80, 110]:
-            errors.append("PRINTER_WIDTH_MM should be 58, 80, or 110 (common thermal sizes)")
+            errors.append("PRINTER_WIDTH_MM should be 58, 80, or 110 (common printer sizes)")
         
         if cls.PRINTER_DPI not in [203, 300]:
-            errors.append("PRINTER_DPI should be 203 or 300 (common thermal DPI)")
+            errors.append("PRINTER_DPI should be 203 or 300 (common printer DPI)")
         
         if not cls.PRINTER_NAME or len(cls.PRINTER_NAME) == 0:
             errors.append("PRINTER_NAME cannot be empty")

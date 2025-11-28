@@ -1,14 +1,29 @@
-# IPP Print Server for Thermal Printers
+# ONE-POS Network Printer Server
 
-Universal IPP (Internet Printing Protocol) server for thermal ESC/POS printers with driverless support. Compatible with Chrome, Android, Linux CUPS, macOS AirPrint, and iOS.
+Universal IPP (Internet Printing Protocol) server that exposes any printer as a **standard network printer** with driverless support. Compatible with Chrome, Android, Linux CUPS, macOS AirPrint, and iOS.
+
+## 🎯 Key Concept
+
+This server presents itself as a **generic network printer** to all clients. Clients send standard documents (PDF, images) without knowing about the physical printer backend. The server handles all format conversion transparently.
+
+**What clients see:**
+- Generic IPP Network Printer
+- Supports standard formats: PDF, JPEG, PNG
+- No special drivers needed
+
+**What happens internally:**
+- Server converts documents to printer-native format automatically
+- Optimizes images for best print quality
+- Handles printer-specific commands (ESC/POS, etc.)
 
 ## 🚀 Features
 
 - **Universal Compatibility**: Works with Chrome, Android (Mopria), Linux (CUPS), macOS (AirPrint), and iOS
 - **Driverless Operation**: No driver installation required on client devices
-- **Multiple Document Formats**: Supports PDF, JPEG, PNG, and PWG Raster
+- **Standard Document Formats**: PDF, JPEG, PNG, and PWG Raster
+- **Transparent Conversion**: Server handles all format conversion automatically
 - **Auto-Discovery**: Uses mDNS/DNS-SD for automatic printer discovery
-- **USB Thermal Printers**: ESC/POS compatible thermal receipt printers
+- **USB Printer Support**: Compatible with ESC/POS and other USB printers
 - **Portable Executable**: Single-file executable for Windows and Linux using PyInstaller
 - **Web Interface**: Built-in web interface for configuration and status
 
@@ -17,13 +32,14 @@ Universal IPP (Internet Printing Protocol) server for thermal ESC/POS printers w
 ### System Requirements
 - **Python**: 3.7 or higher
 - **Operating System**: Windows 10+, Linux, macOS 10.14+
-- **USB Thermal Printer**: ESC/POS compatible (58mm, 80mm, or 110mm)
+- **Printer**: Any USB printer with standard protocol support
 
-### Supported Thermal Printers
+### Supported Printers
+- ESC/POS thermal printers (58mm, 80mm, 110mm)
 - Epson TM series (TM-T20, TM-T82, etc.)
 - Star TSP series (TSP650, TSP700, TSP800)
 - Citizen CT-S310 series
-- Generic ESC/POS thermal printers
+- Other USB printers with standard protocols
 
 ### Dependencies
 - **Required**: `aiohttp`, `zeroconf`, `pyusb`, `pillow`

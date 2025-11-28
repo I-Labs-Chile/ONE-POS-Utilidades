@@ -1304,21 +1304,21 @@ class IPPServer:
         """
         Retorna atributos de marcadores (tinta/papel) para CUPS.
         
-        Para impresoras térmicas sin cartuchos, enviamos valores por defecto
+        Para impresoras sin indicadores de nivel, enviamos valores genéricos
         que indican "no aplicable" o "desconocido".
         """
         return {
             # marker-colors: Lista de colores (vacío para monocromático)
-            'marker-colors': ['#000000'],  # Negro para térmicas
+            'marker-colors': ['#000000'],  # Negro para impresoras monocromáticas
             
-            # marker-names: Nombres de los marcadores
-            'marker-names': ['Thermal Paper'],
+            # marker-names: Nombres genéricos de los marcadores
+            'marker-names': ['Black Ink'],
             
-            # marker-types: Tipo de marcador (ribbonWax, tonerCartridge, etc)
+            # marker-types: Tipo de marcador genérico
             'marker-types': ['continuous-supply'],
             
-            # marker-levels: Nivel actual (0-100, -1=desconocido, -2=no aplica, -3=unknown)
-            'marker-levels': [-3],  # -3 = unknown (CUPS lo acepta)
+            # marker-levels: Nivel actual (-3 = unknown, estándar para impresoras sin sensor)
+            'marker-levels': [-3],  # -3 = unknown (valor estándar IPP)
             
             # marker-high-levels: Nivel alto (umbral)
             'marker-high-levels': [100],
@@ -1328,6 +1328,58 @@ class IPPServer:
             
             # marker-message: Mensaje del estado del marcador
             'marker-message': [''],
+        }
+    
+    def _get_printer_state_info(self) -> Dict[str, Any]:
+        """
+        Calcula el estado actual de la impresora de forma consistente.
+        
+        Returns:
+            dict con keys: state, state_reasons, state_message, is_accepting_jobs
+        """
+        # Determinar estado base (3=idle, 4=processing, 5=stopped)
+        if self.printer_backend and hasattr(self.printer_backend, 'is_ready'):
+            is_ready = self.printer_backend.is_ready()
+            logger.debug(f"Printer backend is_ready(): {is_ready}")
+        elif self.printer_backend and hasattr(self.printer_backend, 'is_connected'):
+            is_ready = self.printer_backend.is_connected
+            logger.debug(f"Printer backend is_connected: {is_ready}")
+        else:
+            is_ready = False
+            logger.debug("No printer backend available")
+        
+        # Si hay jobs activos en estado processing, la impresora está ocupada
+        has_processing_jobs = any(
+            job.get('state') == 'processing' 
+            for job in self.active_jobs.values()
+        )
+        
+        # Calcular estado
+        if not is_ready:
+            state = 5  # stopped
+            state_reasons = 'media-needed'  # O 'offline' o 'paused'
+            state_message = 'Printer not connected or not ready'
+            is_accepting_jobs = False
+        elif has_processing_jobs:
+            state = 4  # processing
+            state_reasons = 'none'
+            state_message = 'Processing job'
+            is_accepting_jobs = True
+        else:
+            state = 3  # idle
+            state_reasons = 'none'
+            state_message = 'Ready to print'
+            is_accepting_jobs = True
+        
+        state_names = {3: 'idle', 4: 'processing', 5: 'stopped'}
+        logger.debug(f"📊 Printer state: {state_names.get(state, 'unknown')} ({state}), "
+                    f"accepting jobs: {is_accepting_jobs}, reasons: {state_reasons}")
+        
+        return {
+            'state': state,
+            'state_reasons': state_reasons,
+            'state_message': state_message,
+            'is_accepting_jobs': is_accepting_jobs
         }
     
     def get_connection_statistics(self) -> Dict[str, Any]:
@@ -1428,22 +1480,21 @@ class IPPServer:
                     self._write_attribute(response, 0x41, 'printer-make-and-model', settings.PRINTER_MAKE_MODEL)
                 
                 elif attr_name == 'printer-state':
-                    if self.printer_backend and hasattr(self.printer_backend, 'is_ready'):
-                        state = 3 if self.printer_backend.is_ready() else 5
-                    elif self.printer_backend and hasattr(self.printer_backend, 'is_connected'):
-                        state = 3 if self.printer_backend.is_connected else 5
-                    else:
-                        state = 5
-                    self._write_attribute(response, 0x23, 'printer-state', state.to_bytes(4, 'big'))
+                    state_info = self._get_printer_state_info()
+                    self._write_attribute(response, 0x23, 'printer-state', state_info['state'].to_bytes(4, 'big'))
                 
                 elif attr_name == 'printer-state-reasons':
-                    self._write_attribute(response, 0x44, 'printer-state-reasons', 'none')
+                    state_info = self._get_printer_state_info()
+                    self._write_attribute(response, 0x44, 'printer-state-reasons', state_info['state_reasons'])
                 
                 elif attr_name == 'printer-state-message':
-                    self._write_attribute(response, 0x41, 'printer-state-message', 'ready')
+                    state_info = self._get_printer_state_info()
+                    self._write_attribute(response, 0x41, 'printer-state-message', state_info['state_message'])
                 
                 elif attr_name == 'printer-is-accepting-jobs':
-                    self._write_attribute(response, 0x22, 'printer-is-accepting-jobs', (1).to_bytes(1, 'big'))
+                    state_info = self._get_printer_state_info()
+                    accepting = 1 if state_info['is_accepting_jobs'] else 0
+                    self._write_attribute(response, 0x22, 'printer-is-accepting-jobs', accepting.to_bytes(1, 'big'))
                 
                 elif attr_name == 'queued-job-count':
                     self._write_attribute(response, 0x21, 'queued-job-count', len(self.active_jobs).to_bytes(4, 'big'))
@@ -1564,6 +1615,8 @@ class IPPServer:
                 
                 elif attr_name == 'output-bin-supported':
                     self._write_attribute(response, 0x44, 'output-bin-supported', 'face-down')
+                
+                elif attr_name == 'output-bin-default':
                     self._write_attribute(response, 0x44, 'output-bin-default', 'face-down')
                 
                 elif attr_name == 'printer-icons':
@@ -1645,6 +1698,119 @@ class IPPServer:
                 elif attr_name == 'job-password-encryption-supported':
                     self._write_attribute(response, 0x44, 'job-password-encryption-supported', 'none')
                 
+                elif attr_name == 'job-presets-supported':
+                    # CUPS/macOS puede solicitar presets de trabajos predefinidos
+                    # Para impresoras térmicas simples, no hay presets
+                    # Enviar colección vacía o simplemente no enviar nada (pass)
+                    pass
+                
+                elif attr_name == 'media-col-database':
+                    # CUPS 2.4+ solicita este atributo para conocer todos los tamaños disponibles
+                    # Responder con una colección de media-col para cada tamaño de papel
+                    # Para impresoras térmicas de 58mm, enviamos una entrada básica
+                    
+                    # Comenzar colección (1setOf)
+                    response.write(bytes([0x34]))  # begCollection tag
+                    response.write((0).to_bytes(2, 'big'))  # name-length = 0 (valor adicional)
+                    response.write((0).to_bytes(2, 'big'))  # value-length = 0
+                    
+                    # media-size (memberAttrName)
+                    response.write(bytes([0x4a]))  # memberAttrName tag
+                    name_bytes = b'media-size'
+                    response.write(len(name_bytes).to_bytes(2, 'big'))
+                    response.write(name_bytes)
+                    response.write((0).to_bytes(2, 'big'))  # value-length = 0
+                    
+                    # Comenzar sub-colección para media-size
+                    response.write(bytes([0x34]))  # begCollection tag
+                    response.write((0).to_bytes(2, 'big'))  # name-length = 0
+                    response.write((0).to_bytes(2, 'big'))  # value-length = 0
+                    
+                    # x-dimension (58mm = 5800 micrometros / 100 = 580 en 0.01mm)
+                    response.write(bytes([0x4a]))  # memberAttrName tag
+                    name_bytes = b'x-dimension'
+                    response.write(len(name_bytes).to_bytes(2, 'big'))
+                    response.write(name_bytes)
+                    response.write((0).to_bytes(2, 'big'))
+                    
+                    response.write(bytes([0x21]))  # integer tag
+                    response.write((0).to_bytes(2, 'big'))  # name-length = 0
+                    response.write((4).to_bytes(2, 'big'))  # value-length = 4
+                    response.write((5800).to_bytes(4, 'big'))  # 58mm en micrometros
+                    
+                    # y-dimension (sin límite para papel continuo, usar valor largo)
+                    response.write(bytes([0x4a]))  # memberAttrName tag
+                    name_bytes = b'y-dimension'
+                    response.write(len(name_bytes).to_bytes(2, 'big'))
+                    response.write(name_bytes)
+                    response.write((0).to_bytes(2, 'big'))
+                    
+                    response.write(bytes([0x21]))  # integer tag
+                    response.write((0).to_bytes(2, 'big'))
+                    response.write((4).to_bytes(2, 'big'))
+                    response.write((30000).to_bytes(4, 'big'))  # 300mm máximo
+                    
+                    # Cerrar sub-colección media-size
+                    response.write(bytes([0x37]))  # endCollection tag
+                    response.write((0).to_bytes(2, 'big'))
+                    response.write((0).to_bytes(2, 'big'))
+                    
+                    # media-type
+                    response.write(bytes([0x4a]))  # memberAttrName tag
+                    name_bytes = b'media-type'
+                    response.write(len(name_bytes).to_bytes(2, 'big'))
+                    response.write(name_bytes)
+                    response.write((0).to_bytes(2, 'big'))
+                    
+                    response.write(bytes([0x44]))  # keyword tag
+                    response.write((0).to_bytes(2, 'big'))
+                    value_bytes = b'continuous'
+                    response.write(len(value_bytes).to_bytes(2, 'big'))
+                    response.write(value_bytes)
+                    
+                    # media-source
+                    response.write(bytes([0x4a]))  # memberAttrName tag
+                    name_bytes = b'media-source'
+                    response.write(len(name_bytes).to_bytes(2, 'big'))
+                    response.write(name_bytes)
+                    response.write((0).to_bytes(2, 'big'))
+                    
+                    response.write(bytes([0x44]))  # keyword tag
+                    response.write((0).to_bytes(2, 'big'))
+                    value_bytes = b'auto'
+                    response.write(len(value_bytes).to_bytes(2, 'big'))
+                    response.write(value_bytes)
+                    
+                    # Cerrar colección principal
+                    response.write(bytes([0x37]))  # endCollection tag
+                    response.write((0).to_bytes(2, 'big'))
+                    response.write((0).to_bytes(2, 'big'))
+                    
+                    logger.debug("✅ Sent media-col-database with printer paper specifications")
+                
+                elif attr_name == 'document-format-preferred':
+                    # Formato preferido: PDF (estándar y universal)
+                    self._write_attribute(response, 0x49, 'document-format-preferred', 'application/pdf')
+                    logger.debug("✅ Sent document-format-preferred: application/pdf")
+                
+                elif attr_name == 'device-uri':
+                    # URI del dispositivo físico (para impresoras de red es el mismo que printer-uri)
+                    device_uri = f'ipp://{local_ip}:{self.port}/ipp/printer'
+                    self._write_attribute(response, 0x45, 'device-uri', device_uri)
+                    logger.debug(f"✅ Sent device-uri: {device_uri}")
+                
+                elif attr_name == 'printer-dns-sd-name':
+                    # Nombre DNS-SD/mDNS (Bonjour/Zeroconf)
+                    dns_sd_name = f"{settings.PRINTER_NAME}._ipp._tcp.local."
+                    self._write_attribute(response, 0x41, 'printer-dns-sd-name', dns_sd_name)
+                    logger.debug(f"✅ Sent printer-dns-sd-name: {dns_sd_name}")
+                
+                elif attr_name == 'printer-more-info':
+                    # URL con más información sobre la impresora (interfaz web)
+                    more_info_url = f'http://{local_ip}:{self.port}/'
+                    self._write_attribute(response, 0x45, 'printer-more-info', more_info_url)
+                    logger.debug(f"✅ Sent printer-more-info: {more_info_url}")
+                
                 else:
                     logger.debug(f"⚠️ Requested attribute '{attr_name}' not implemented")
             
@@ -1684,20 +1850,21 @@ class IPPServer:
             # printer-make-and-model
             self._write_attribute(response, 0x41, 'printer-make-and-model', settings.PRINTER_MAKE_MODEL)
             
+            # Obtener estado consistente
+            state_info = self._get_printer_state_info()
+            
             # printer-state (3=idle, 4=processing, 5=stopped)
-            if self.printer_backend and hasattr(self.printer_backend, 'is_ready'):
-                state = 3 if self.printer_backend.is_ready() else 5
-            elif self.printer_backend and hasattr(self.printer_backend, 'is_connected'):
-                state = 3 if self.printer_backend.is_connected else 5
-            else:
-                state = 5
-            self._write_attribute(response, 0x23, 'printer-state', state.to_bytes(4, 'big'))
+            self._write_attribute(response, 0x23, 'printer-state', state_info['state'].to_bytes(4, 'big'))
             
             # printer-state-reasons
-            self._write_attribute(response, 0x44, 'printer-state-reasons', 'none')
+            self._write_attribute(response, 0x44, 'printer-state-reasons', state_info['state_reasons'])
+            
+            # printer-state-message
+            self._write_attribute(response, 0x41, 'printer-state-message', state_info['state_message'])
             
             # printer-is-accepting-jobs
-            self._write_attribute(response, 0x22, 'printer-is-accepting-jobs', (1).to_bytes(1, 'big'))
+            accepting = 1 if state_info['is_accepting_jobs'] else 0
+            self._write_attribute(response, 0x22, 'printer-is-accepting-jobs', accepting.to_bytes(1, 'big'))
             
             # queued-job-count
             self._write_attribute(response, 0x21, 'queued-job-count', len(self.active_jobs).to_bytes(4, 'big'))
@@ -1714,6 +1881,21 @@ class IPPServer:
             
             # document-format-default
             self._write_attribute(response, 0x49, 'document-format-default', 'application/octet-stream')
+            
+            # document-format-preferred (formato preferido: PDF es el más universal)
+            self._write_attribute(response, 0x49, 'document-format-preferred', 'application/pdf')
+            
+            # device-uri (URI del dispositivo físico)
+            device_uri = f'ipp://{local_ip}:{self.port}/ipp/printer'
+            self._write_attribute(response, 0x45, 'device-uri', device_uri)
+            
+            # printer-dns-sd-name (nombre mDNS/Bonjour)
+            dns_sd_name = f"{settings.PRINTER_NAME}._ipp._tcp.local."
+            self._write_attribute(response, 0x41, 'printer-dns-sd-name', dns_sd_name)
+            
+            # printer-more-info (URL de interfaz web)
+            more_info_url = f'http://{local_ip}:{self.port}/'
+            self._write_attribute(response, 0x45, 'printer-more-info', more_info_url)
             
             # ========== ATRIBUTOS DE MARCADORES (CRÍTICO PARA CUPS) ==========
             # marker-colors
@@ -1770,6 +1952,10 @@ class IPPServer:
             # job-password-encryption-supported
             self._write_attribute(response, 0x44, 'job-password-encryption-supported', 'none')
             
+            # job-presets-supported (CUPS/macOS extension)
+            # Para impresoras simples sin presets, no enviar nada
+            # self._write_attribute(response, 0x44, 'job-presets-supported', 'none')
+            
             # printer-alert
             self._write_attribute(response, 0x44, 'printer-alert', 'none')
             
@@ -1797,6 +1983,80 @@ class IPPServer:
             
             # media-default
             self._write_attribute(response, 0x44, 'media-default', 'oe_roll_58mm')
+            
+            # media-col-database (CUPS 2.4+)
+            # Colección que describe completamente los tamaños de papel disponibles
+            response.write(bytes([0x34]))  # begCollection tag
+            response.write((0).to_bytes(2, 'big'))
+            response.write((0).to_bytes(2, 'big'))
+            
+            # media-size
+            response.write(bytes([0x4a]))  # memberAttrName
+            name_bytes = b'media-size'
+            response.write(len(name_bytes).to_bytes(2, 'big'))
+            response.write(name_bytes)
+            response.write((0).to_bytes(2, 'big'))
+            
+            # Sub-colección media-size
+            response.write(bytes([0x34]))  # begCollection
+            response.write((0).to_bytes(2, 'big'))
+            response.write((0).to_bytes(2, 'big'))
+            
+            # x-dimension
+            response.write(bytes([0x4a]))
+            name_bytes = b'x-dimension'
+            response.write(len(name_bytes).to_bytes(2, 'big'))
+            response.write(name_bytes)
+            response.write((0).to_bytes(2, 'big'))
+            response.write(bytes([0x21]))
+            response.write((0).to_bytes(2, 'big'))
+            response.write((4).to_bytes(2, 'big'))
+            response.write((5800).to_bytes(4, 'big'))
+            
+            # y-dimension
+            response.write(bytes([0x4a]))
+            name_bytes = b'y-dimension'
+            response.write(len(name_bytes).to_bytes(2, 'big'))
+            response.write(name_bytes)
+            response.write((0).to_bytes(2, 'big'))
+            response.write(bytes([0x21]))
+            response.write((0).to_bytes(2, 'big'))
+            response.write((4).to_bytes(2, 'big'))
+            response.write((30000).to_bytes(4, 'big'))
+            
+            # Cerrar media-size
+            response.write(bytes([0x37]))  # endCollection
+            response.write((0).to_bytes(2, 'big'))
+            response.write((0).to_bytes(2, 'big'))
+            
+            # media-type
+            response.write(bytes([0x4a]))
+            name_bytes = b'media-type'
+            response.write(len(name_bytes).to_bytes(2, 'big'))
+            response.write(name_bytes)
+            response.write((0).to_bytes(2, 'big'))
+            response.write(bytes([0x44]))
+            response.write((0).to_bytes(2, 'big'))
+            value_bytes = b'continuous'
+            response.write(len(value_bytes).to_bytes(2, 'big'))
+            response.write(value_bytes)
+            
+            # media-source
+            response.write(bytes([0x4a]))
+            name_bytes = b'media-source'
+            response.write(len(name_bytes).to_bytes(2, 'big'))
+            response.write(name_bytes)
+            response.write((0).to_bytes(2, 'big'))
+            response.write(bytes([0x44]))
+            response.write((0).to_bytes(2, 'big'))
+            value_bytes = b'auto'
+            response.write(len(value_bytes).to_bytes(2, 'big'))
+            response.write(value_bytes)
+            
+            # Cerrar colección principal
+            response.write(bytes([0x37]))  # endCollection
+            response.write((0).to_bytes(2, 'big'))
+            response.write((0).to_bytes(2, 'big'))
             
             # End of attributes
             response.write(bytes([0x03]))

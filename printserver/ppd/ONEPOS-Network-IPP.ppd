@@ -1,0 +1,65 @@
+*PPD-Adobe: "4.3"
+*% ONE POS Network IPP Printer - Generic PPD
+*FormatVersion: "4.3"
+*FileVersion: "2.0"
+*LanguageVersion: English
+*LanguageEncoding: ISOLatin1
+*PCFileName: "ONEPOSIPP.PPD"
+*Manufacturer: "ONE-POS"
+*ModelName: "ONE-POS Network Printer"
+*NickName: "ONE-POS Network Printer (IPP, PDF/JPEG/PNG)"
+*ShortNickName: "ONEPOS IPP"
+*Product: "(Network Printer)"
+*cupsVersion: 2.4
+*cupsModelNumber: 58
+*cupsManualCopies: True
+*cupsSNMPSupplies: False
+*ColorDevice: False
+*DefaultColorSpace: Gray
+
+*% Pass-through filters - server handles conversion transparently
+*cupsFilter: "application/pdf 0 -"
+*cupsFilter: "image/jpeg 0 -"
+*cupsFilter: "image/png 0 -"
+*cupsFilter: "image/pwg-raster 0 -"
+*cupsFilter: "text/plain 0 -"
+
+*% Resolution (standard printer resolution)
+*OpenUI *Resolution/Resolution: PickOne
+*DefaultResolution: 203dpi
+*Resolution 203dpi/203 DPI: "<</HWResolution[203 203]>>setpagedevice"
+*Resolution 300dpi/300 DPI: "<</HWResolution[300 300]>>setpagedevice"
+*CloseUI: *Resolution
+
+*OpenUI *MediaType/Media Type: PickOne
+*DefaultMediaType: Plain
+*MediaType Plain/Plain Paper: ""
+*MediaType Continuous/Continuous Roll: ""
+*CloseUI: *MediaType
+
+*% Define reasonable page sizes for small format printing
+*OpenUI *PageSize/Page Size: PickOne
+*DefaultPageSize: Roll-58x200mm
+*PageSize Roll-58x200mm/58mm x 200mm: "<</PageSize[164 566]>>setpagedevice"
+*PageSize Roll-58x150mm/58mm x 150mm: "<</PageSize[164 425]>>setpagedevice"
+*PageSize Roll-58x100mm/58mm x 100mm: "<</PageSize[164 283]>>setpagedevice"
+*CloseUI: *PageSize
+
+*ImageableArea Roll-58x200mm: "0 0 164 566"
+*PaperDimension Roll-58x200mm: "164 566"
+*ImageableArea Roll-58x150mm: "0 0 164 425"
+*PaperDimension Roll-58x150mm: "164 425"
+*ImageableArea Roll-58x100mm: "0 0 164 283"
+*PaperDimension Roll-58x100mm: "164 283"
+
+*% Margins
+*HWMargins: "0 0 0 0"
+
+*% Duplex not supported
+*OpenUI *Duplex/Two-Sided Printing: PickOne
+*DefaultDuplex: None
+*Duplex None/Off: "<</Duplex false>>setpagedevice"
+*CloseUI: *Duplex
+
+*DefaultFont: Courier
+*Font Courier: Standard "(1.0)" Standard ROM
