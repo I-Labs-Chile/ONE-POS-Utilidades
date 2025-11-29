@@ -18,73 +18,73 @@ class USBPrinterBackend:
         self.detector = USBPrinterDetector()
         self.current_printer: Optional[USBPrinterInfo] = None
 
-        logger.info("USBPrinterBackend initialized")
+        logger.info("USBPrinterBackend inicializado")
 
         # Auto-detect si no se especificó device
         if not self.device_path:
-            logger.info("No device path specified, will auto-detect on connect")
+            logger.info("No se especificó ruta de dispositivo, se auto-detectará al conectar")
     
     def connect(self) -> bool:
 
         # Intento de conexión a la impresora. Realiza auto-detección si es necesario.
         try:
             if not self.device_path:
-                logger.info("🔍 Auto-detecting printer...")
+                logger.info("🔍 Auto-detectando impresora...")
                 printers = self.detector.scan_for_printers()
 
                 if not printers:
-                    logger.error("❌ No printers detected")
-                    logger.info("💡 Make sure:")
-                    logger.info("   1. Printer is connected via USB")
-                    logger.info("   2. Printer is powered on")
-                    logger.info("   3. User has permissions (add to lp/lpadmin group)")
+                    logger.error("❌ No se detectaron impresoras")
+                    logger.info("💡 Verifique:")
+                    logger.info("   1. La impresora está conectada por USB")
+                    logger.info("   2. La impresora está encendida")
+                    logger.info("   3. El usuario tiene permisos (agregar a grupos lp/lpadmin)")
                     return False
 
                 # Usar la primera impresora detectada
                 self.current_printer = printers[0]
                 self.device_path = self.current_printer.device_path
 
-                logger.info(f"✅ Auto-detected: {self.current_printer.friendly_name}")
-                logger.info(f"   Device: {self.device_path}")
+                logger.info(f"✅ Auto-detectada: {self.current_printer.friendly_name}")
+                logger.info(f"   Dispositivo: {self.device_path}")
 
                 if self.current_printer.vendor_id:
-                    logger.info(f"   Vendor ID: {self.current_printer.vendor_id}")
+                    logger.info(f"   ID de proveedor: {self.current_printer.vendor_id}")
                 if self.current_printer.product_id:
-                    logger.info(f"   Product ID: {self.current_printer.product_id}")
+                    logger.info(f"   ID de producto: {self.current_printer.product_id}")
 
                 if self.detector.is_thermal_printer(self.current_printer):
-                    logger.info("   🔥 Thermal printer detected")
+                    logger.info("   🔥 Impresora térmica detectada")
 
             # Verificar que el dispositivo existe
             if not os.path.exists(self.device_path):
-                logger.error(f"❌ Device not found: {self.device_path}")
+                logger.error(f"❌ Dispositivo no encontrado: {self.device_path}")
                 return False
 
             # Verificar permisos de escritura
             if not self.detector.test_printer_connection(self.device_path):
-                logger.error(f"❌ Cannot write to {self.device_path}")
-                logger.info("💡 Try: sudo usermod -a -G lp $USER")
-                logger.info("   Then logout and login again")
+                logger.error(f"❌ No se puede escribir en {self.device_path}")
+                logger.info("💡 Intente: sudo usermod -a -G lp $USER")
+                logger.info("   Luego cierre sesión y vuelva a ingresar")
                 return False
 
             # Abrir dispositivo en modo binario sin buffering
-            logger.info(f"🔌 Connecting to {self.device_path}...")
+            logger.info(f"🔌 Conectando a {self.device_path}...")
             self.device_handle = open(self.device_path, 'wb', buffering=0)
             self.is_connected = True
 
             # Enviar comando de inicialización ESC @
             self._send_init_command()
 
-            logger.info(f"✅ Connected to printer: {self.device_path}")
+            logger.info(f"✅ Conectado a la impresora: {self.device_path}")
             return True
 
         except PermissionError:
-            logger.error(f"❌ Permission denied: {self.device_path}")
-            logger.info("💡 Run: sudo chmod 666 {self.device_path}")
-            logger.info("   Or add user to lp group: sudo usermod -a -G lp $USER")
+            logger.error(f"❌ Permiso denegado: {self.device_path}")
+            logger.info("💡 Ejecutar: sudo chmod 666 {self.device_path}")
+            logger.info("   O agregar usuario al grupo lp: sudo usermod -a -G lp $USER")
             return False
         except Exception as e:
-            logger.error(f"❌ Failed to connect: {e}")
+            logger.error(f"❌ Falló la conexión: {e}")
             import traceback
             logger.debug(f"Connection error: {traceback.format_exc()}")
             return False
@@ -97,9 +97,9 @@ class USBPrinterBackend:
             self.device_handle.write(init_cmd)
             self.device_handle.flush()
             time.sleep(0.1)
-            logger.debug("Sent initialization command")
+            logger.debug("Comando de inicialización enviado")
         except Exception as e:
-            logger.warning(f"Failed to send init command: {e}")
+            logger.warning(f"Error al enviar comando de inicialización: {e}")
     
     # Cierra el handle del dispositivo y marca como desconectado.
     def disconnect(self):
@@ -107,7 +107,7 @@ class USBPrinterBackend:
         if self.device_handle:
             try:
                 self.device_handle.close()
-                logger.info(f"Disconnected from {self.device_path}")
+                logger.info(f"Desconectado de {self.device_path}")
             except:
                 pass
             finally:
@@ -118,20 +118,20 @@ class USBPrinterBackend:
     def send_raw(self, data: bytes) -> bool:
 
         if not self.is_connected:
-            logger.warning("Printer not connected, attempting auto-connect...")
+            logger.warning("Impresora no conectada, intentando auto-conectar...")
             if not self.connect():
-                logger.error("Failed to auto-connect")
+                logger.error("Fallo en auto-conexión")
                 return False
 
         try:
-            logger.debug(f"Sending {len(data)} bytes to printer...")
+            logger.debug(f"Enviando {len(data)} bytes a la impresora...")
             self.device_handle.write(data)
             self.device_handle.flush()
-            logger.info(f"✅ Sent {len(data)} bytes successfully")
+            logger.info(f"✅ {len(data)} bytes enviados correctamente")
             return True
 
         except Exception as e:
-            logger.error(f"❌ Failed to send data: {e}")
+            logger.error(f"❌ Error al enviar datos: {e}")
             self.is_connected = False
             return False
     # Indica si el backend está conectado y listo para enviar datos.

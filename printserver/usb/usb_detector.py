@@ -65,12 +65,12 @@ class USBPrinterDetector:
 
         # Lista interna de impresoras detectadas
         self.detected_printers: List[USBPrinterInfo] = []
-        logger.info("USBPrinterDetector initialized")
+        logger.info("USBPrinterDetector inicializado")
     
     def scan_for_printers(self) -> List[USBPrinterInfo]:
 
         # Escanea el sistema en busca de impresoras USB.
-        logger.info("🔍 Scanning for USB printers...")
+        logger.info("🔍 Escaneando impresoras USB...")
         self.detected_printers = []
 
         # 1) Buscar nodos de dispositivo típicos (/dev/usb/lp*, /dev/lp*)
@@ -95,7 +95,7 @@ class USBPrinterDetector:
             if printer.device_path not in all_devices:
                 self.detected_printers.append(printer)
 
-        logger.info(f"✅ Found {len(self.detected_printers)} printer(s)")
+        logger.info(f"✅ Se encontraron {len(self.detected_printers)} impresora(s)")
         for printer in self.detected_printers:
             logger.info(f"   📌 {printer.friendly_name} → {printer.device_path}")
 
@@ -112,10 +112,10 @@ class USBPrinterDetector:
                 if os.path.exists(device):
                     # Añadir solo si es escribible
                     if os.access(device, os.W_OK):
-                        logger.debug(f"Found writable device: {device}")
+                        logger.debug(f"Dispositivo escribible encontrado: {device}")
                         printers.append(USBPrinterInfo(device_path=device))
                     else:
-                        logger.warning(f"Found device {device} but no write permission")
+                        logger.warning(f"Dispositivo {device} encontrado sin permiso de escritura")
 
         return printers
     
@@ -129,19 +129,19 @@ class USBPrinterDetector:
                                     timeout=5)
 
             if result.returncode != 0:
-                logger.warning("lsusb command failed")
+                logger.warning("El comando lsusb falló")
                 return []
 
             return self._parse_lsusb_output(result.stdout)
 
         except FileNotFoundError:
-            logger.warning("lsusb not found, install usbutils package")
+            logger.warning("lsusb no encontrado, instale el paquete usbutils")
             return []
         except subprocess.TimeoutExpired:
-            logger.warning("lsusb command timed out")
+            logger.warning("Tiempo de espera de lsusb agotado")
             return []
         except Exception as e:
-            logger.error(f"Error running lsusb: {e}")
+            logger.error(f"Error ejecutando lsusb: {e}")
             return []
     
     def _parse_lsusb_output(self, output: str) -> List[Dict]:
@@ -193,7 +193,7 @@ class USBPrinterDetector:
         printers = [d for d in devices if d.get('is_printer', False) or
                     d.get('vendor_id', '').lower() in [v.lower() for v in self.KNOWN_THERMAL_VENDORS.keys()]]
 
-        logger.debug(f"lsusb found {len(printers)} printer device(s)")
+        logger.debug(f"lsusb encontró {len(printers)} dispositivo(s) de impresora")
         return printers
     
     # Revisa sysfs (/sys/class/usb) para obtener información de dispositivos conectados.
@@ -233,10 +233,10 @@ class USBPrinterDetector:
                         serial=serial
                     )
                     printers.append(printer)
-                    logger.debug(f"sysfs: Found {printer}")
+                    logger.debug(f"sysfs: encontrado {printer}")
 
             except Exception as e:
-                logger.debug(f"Error reading sysfs device {device_path}: {e}")
+                logger.debug(f"Error leyendo dispositivo sysfs {device_path}: {e}")
 
         return printers
     
@@ -308,14 +308,14 @@ class USBPrinterDetector:
         try:
             with open(device_path, 'wb') as f:
                 pass
-            logger.debug(f"✅ Device {device_path} is writable")
+            logger.debug(f"✅ El dispositivo {device_path} es escribible")
             return True
         except PermissionError:
-            logger.warning(f"⚠️ No permission to write to {device_path}")
+            logger.warning(f"⚠️ Sin permiso de escritura para {device_path}")
             return False
         except FileNotFoundError:
-            logger.warning(f"⚠️ Device {device_path} not found")
+            logger.warning(f"⚠️ Dispositivo {device_path} no encontrado")
             return False
         except Exception as e:
-            logger.error(f"❌ Error testing {device_path}: {e}")
+            logger.error(f"❌ Error probando {device_path}: {e}")
             return False

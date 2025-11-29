@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
+
+from pathlib import Path
 import sys
 import socket
-from pathlib import Path
 
-# Add project root to path - CORREGIDO
-project_root = Path(__file__).parent.parent  # tests -> printserver
+# Inserta la raíz del proyecto para permitir importaciones del servidor
+project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from server.converter import DocumentConverter
 from config.settings import settings
 import asyncio
 
+# Obtiene IP local preferente para mostrar configuración de red (con fallback)
 def get_local_ip():
     try:
-        # Método que funciona en Windows, Linux, macOS
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.settimeout(1)
             s.connect(("8.8.8.8", 80))
             return s.getsockname()[0]
     except Exception:
-        # Fallback: obtener hostname
         try:
             return socket.gethostbyname(socket.gethostname())
         except Exception:
             return "localhost"
 
+# Muestra parámetros de conexión IPP y configuración para clientes externos
 def show_network_config():
     local_ip = get_local_ip()
-    
     print("=" * 50)
     print("📡 CONFIGURACIÓN DE RED PARA CLIENTES")
     print("=" * 50)
@@ -44,26 +44,23 @@ def show_network_config():
     print("=" * 50)
     print()
 
+# Prueba conversión de un PDF existente a comandos ESC/POS guardando salida
 async def test_pdf_conversion():
     print(f"⚙️  Configuración de impresora:")
     print(f"  PRINTER_WIDTH_MM: {settings.PRINTER_WIDTH_MM}mm")
     print(f"  PRINTER_MAX_PIXELS: {settings.PRINTER_MAX_PIXELS}px")
     print(f"  PRINTER_DPI: {settings.PRINTER_DPI}")
     print()
-    
     show_network_config()
-    
+
     converter = DocumentConverter()
-    
-    # Buscar archivos de prueba en varios lugares
     search_paths = [
         Path(__file__).parent,
         Path(__file__).parent.parent,
         Path.cwd(),
     ]
-    
+
     test_files = ["test_document.pdf", "test.pdf", "documento.pdf", "prueba.pdf"]
-    
     found_file = None
     for search_path in search_paths:
         for test_file in test_files:
@@ -73,26 +70,19 @@ async def test_pdf_conversion():
                 break
         if found_file:
             break
-    
+
     if found_file:
         with open(found_file, 'rb') as f:
             pdf_data = f.read()
-        
         print(f"📄 Convirtiendo {found_file.name}...")
         print(f"📊 Tamaño original: {len(pdf_data)} bytes")
-        
         try:
-            # Convertir a ESC/POS
             escpos_data = await converter.convert_to_escpos(pdf_data, 'application/pdf')
-            
             print(f"✅ Conversión completada: {len(escpos_data)} bytes de datos ESC/POS")
-            
-            # Guardar resultado para inspección
             output_file = Path(__file__).parent / 'output.escpos'
             with open(output_file, 'wb') as f:
                 f.write(escpos_data)
             print(f"💾 Resultado guardado en {output_file}")
-            
         except Exception as e:
             print(f"❌ Error en conversión: {e}")
             import traceback
