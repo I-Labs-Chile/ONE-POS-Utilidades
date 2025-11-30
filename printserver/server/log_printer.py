@@ -1,7 +1,7 @@
+from typing import Optional, List
+from datetime import datetime
 import asyncio
 import logging
-from datetime import datetime
-from typing import Optional, List
 import io
 
 logger = logging.getLogger(__name__)
@@ -19,23 +19,31 @@ class LogPrinter:
         self.ESC = b'\x1b'
         self.GS = b'\x1d'
         
-    # Asigna el backend de impresión a utilizar
+    # Asigna el backend de impresión a utilizar.
+    # Parámetros: printer_backend (objeto con método async send_raw(bytes)).
+    # Efecto: cambia el backend usado para enviar datos ESC/POS.
     def set_printer_backend(self, printer_backend):
         self.printer_backend = printer_backend
         
-    # Habilita la impresión de logs; niveles posibles: ['INFO','WARNING','ERROR']
+    # Habilita la impresión de logs.
+    # Parámetros: log_levels (lista opcional de niveles permitidos: ['INFO','WARNING','ERROR']).
+    # Efecto: activa la salida de logs hacia la impresora según niveles seleccionados.
     def enable(self, log_levels: Optional[List[str]] = None):
         self.enabled = True
         if log_levels:
             self.log_levels = log_levels
         logger.info(f"Impresión de logs habilitada para niveles: {self.log_levels}")
         
-    # Deshabilita la impresión de logs
+    # Deshabilita la impresión de logs.
+    # Efecto: detiene la salida de logs hacia la impresora.
     def disable(self):
         self.enabled = False
         logger.info("Impresión de logs deshabilitada")
         
-    # Imprime un log con nivel y mensaje; módulo opcional para identificar origen
+    # Imprime un log con nivel y mensaje.
+    # Parámetros: level (str), message (str), module (str opcional para identificar origen).
+    # Condiciones: solo imprime si está habilitado y el nivel está permitido.
+    # Retorno: None (operación asíncrona que envía datos ESC/POS).
     async def print_log(self, level: str, message: str, module: str = ""):
 
         if not self.enabled or not self.printer_backend:
@@ -55,7 +63,9 @@ class LogPrinter:
             # Evitar recursión de logs
             print(f"Fallo al imprimir log en impresora: {e}")
     
-    # Genera bytes ESC/POS con encabezado y mensaje envueltos a ancho de papel
+    # Genera bytes ESC/POS con encabezado y mensaje envueltos al ancho del papel.
+    # Parámetros: level (str), message (str), module (str opcional).
+    # Retorno: bytes listos para enviar por ESC/POS.
     def _create_log_entry(self, level: str, message: str, module: str = "") -> bytes:
 
         output = io.BytesIO()
@@ -93,7 +103,9 @@ class LogPrinter:
         
         return output.getvalue()
     
-    # Envuelve texto al ancho máximo de línea conservando palabras
+    # Envuelve texto al ancho máximo de línea conservando palabras.
+    # Parámetros: text (str).
+    # Retorno: str con saltos de línea insertados para respetar max_line_length.
     def _wrap_text(self, text: str) -> str:
 
         if len(text) <= self.max_line_length:
@@ -116,7 +128,9 @@ class LogPrinter:
             
         return '\n'.join(lines)
     
-    # Imprime un banner de inicio con información del servidor (host, puerto, versión)
+    # Imprime un banner de inicio con información del servidor.
+    # Parámetros: server_info (dict con 'version', 'host', 'port').
+    # Retorno: None; envía datos ESC/POS al backend.
     async def print_startup_banner(self, server_info: dict):
 
         if not self.enabled or not self.printer_backend:
@@ -156,7 +170,9 @@ class LogPrinter:
         except Exception as e:
             print(f"Fallo al imprimir banner de inicio: {e}")
     
-    # Imprime un reporte de estado con métricas básicas (impresora y trabajos)
+    # Imprime un reporte de estado con métricas básicas (impresora y trabajos).
+    # Parámetros: status_info (dict con claves 'printer' y/o 'jobs').
+    # Retorno: None; envía datos ESC/POS al backend.
     async def print_status_report(self, status_info: dict):
 
         if not self.enabled or not self.printer_backend:
@@ -208,7 +224,9 @@ class PrinterLogHandler(logging.Handler):
         self.log_printer = log_printer
         self.loop = None
         
-    # Emite un registro de logging hacia la impresora si está habilitado
+    # Emite un registro de logging hacia la impresora si está habilitado.
+    # Parámetros: record (logging.LogRecord).
+    # Comportamiento: si hay loop activo, programa una tarea para imprimir.
     def emit(self, record):
         if self.log_printer and self.log_printer.enabled:
             try:

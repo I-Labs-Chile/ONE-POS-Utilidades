@@ -1,19 +1,15 @@
+from typing import Dict, Any, Optional, List, Tuple
+from datetime import datetime
+from pathlib import Path
+import traceback
 import asyncio
-import io
 import logging
 import socket
-from datetime import datetime
-import json
 import time
-from pathlib import Path
-
-# Simple internal debugging without external dependencies
-DEBUG_ENABLED = True
-DEBUG_DIR = Path(__file__).parent.parent / "debug_logs"
-from typing import Dict, Any, Optional, List, Tuple
 import json
+import io
 
-# Try relative import first, fallback to absolute
+# Intentar importación relativa primero; fallback a absoluta
 try:
     from ..config.settings import settings
 except ImportError:
@@ -21,8 +17,15 @@ except ImportError:
 
 from .port_manager import PortManager
 
+# Control de depuración interna sin dependencias externas
+DEBUG_ENABLED = True
+DEBUG_DIR = Path(__file__).parent.parent / "debug_logs"
+
 logger = logging.getLogger(__name__)
 
+
+# Registra mensajes de depuración específicos para clientes Android
+# Crea archivo de log individual por IP cliente con timestamp y datos JSON
 def log_android_debug(client_ip: str, message: str, data: dict = None):
 
     if not DEBUG_ENABLED:
@@ -41,9 +44,12 @@ def log_android_debug(client_ip: str, message: str, data: dict = None):
     with open(debug_file, 'a', encoding='utf-8') as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
         if data:
-            f.write(f"  Data: {json.dumps(data, indent=2, default=str)}\n")
+            f.write(f"  Datos: {json.dumps(data, indent=2, default=str)}\n")
         f.write("-" * 50 + "\n")
 
+
+# Guarda datos crudos de request HTTP y metadatos para análisis posterior
+# Útil para depurar problemas de protocolo IPP con clientes específicos
 def save_request_data(client_ip: str, request_data: bytes, headers: dict, path: str):
 
     if not DEBUG_ENABLED:
@@ -51,13 +57,13 @@ def save_request_data(client_ip: str, request_data: bytes, headers: dict, path: 
         
     DEBUG_DIR.mkdir(exist_ok=True)
     
-    # Save raw data
+    # Guardar datos crudos
     timestamp = int(time.time())
     raw_file = DEBUG_DIR / f"request_{client_ip.replace('.', '_')}_{timestamp}.bin"
     with open(raw_file, 'wb') as f:
         f.write(request_data)
     
-    # Save metadata
+    # Guardar metadatos
     meta_file = DEBUG_DIR / f"request_{client_ip.replace('.', '_')}_{timestamp}.json"
     metadata = {
         'timestamp': timestamp,
@@ -70,6 +76,9 @@ def save_request_data(client_ip: str, request_data: bytes, headers: dict, path: 
     with open(meta_file, 'w', encoding='utf-8') as f:
         json.dump(metadata, f, indent=2, default=str)
 
+
+# Representa un mensaje IPP completo con encabezado y grupos de atributos
+# Estructura según RFC 8011 para comunicación con impresoras IPP
 class IPPMessage:
     
     def __init__(self):
@@ -81,147 +90,132 @@ class IPPMessage:
         self.printer_attributes = {}
         self.document_data = None
 
+
+# Parsea un buffer IPP binario y construye un objeto IPPMessage
+# Implementa el parsing según RFC 8011 con manejo de errores robusto
 def parse_ipp_request(data: bytes) -> IPPMessage:
 
     message = IPPMessage()
-    
+
     if len(data) < 8:
-        logger.error(f"IPP data too short: {len(data)} bytes (minimum 8 required)")
+        logger.error(f"Datos IPP demasiado cortos: {len(data)} bytes (mínimo 8 requerido)")
         return message
-    
+
     try:
-        # Parse IPP header (8 bytes)
+        # Encabezado IPP (8 bytes)
         message.version_number = (data[0], data[1])
         message.operation_id = int.from_bytes(data[2:4], 'big')
         message.request_id = int.from_bytes(data[4:8], 'big')
-        
-        logger.debug(f"Parsed IPP header - Version: {message.version_number}, "
-                    f"Operation: 0x{message.operation_id:04x}, Request ID: {message.request_id}")
-        
-        # Parse attributes (RFC 8011 compliant)
+        logger.debug(
+            f"Encabezado IPP parseado - Versión: {message.version_number}, "
+            f"Operación: 0x{message.operation_id:04x}, Request ID: {message.request_id}"
+        )
+
+        # Parseo de atributos (RFC 8011)
         offset = 8
         current_group = None
+        last_attribute_name: Optional[str] = None
         attr_count = 0
-        last_attribute_name = None  # Para manejar valores múltiples según RFC 8011
-        
+
         def _store_attribute(target: dict, name: str, attr_value: 'AttributeValue'):
-            """Store attribute supporting multi-valued attributes (RFC 8011 5.1.4)."""
             existing = target.get(name)
             if existing is None:
                 target[name] = attr_value
+            elif isinstance(existing, list):
+                existing.append(attr_value)
             else:
-                # Convert to list and append
-                if isinstance(existing, list):
-                    existing.append(attr_value)
-                else:
-                    target[name] = [existing, attr_value]
+                target[name] = [existing, attr_value]
 
         while offset < len(data):
-            if offset + 1 >= len(data):
-                logger.debug(f"End of data reached at offset {offset}")
-                break
-                
+            # Tag de grupo o fin
             tag = data[offset]
             offset += 1
-            
-            if tag == 0x01:  # operation-attributes-tag
+
+            if tag == 0x03:  # end-of-attributes-tag
+                logger.debug("Fin de atributos IPP")
+                break
+            elif tag == 0x01:
                 current_group = 'operation'
-                last_attribute_name = None  # Reset en nuevo grupo
-                logger.debug("Found operation-attributes-tag")
+                last_attribute_name = None
                 continue
-            elif tag == 0x02:  # job-attributes-tag
+            elif tag == 0x02:
                 current_group = 'job'
-                last_attribute_name = None  # Reset en nuevo grupo
-                logger.debug("Found job-attributes-tag")
+                last_attribute_name = None
                 continue
-            elif tag == 0x04:  # printer-attributes-tag
+            elif tag == 0x04:
                 current_group = 'printer'
-                last_attribute_name = None  # Reset en nuevo grupo
-                logger.debug("Found printer-attributes-tag")
+                last_attribute_name = None
                 continue
-            elif tag == 0x03:  # end-of-attributes-tag
-                # Document data follows
-                doc_size = len(data) - offset
-                logger.debug(f"Found end-of-attributes-tag, document data: {doc_size} bytes")
-                message.document_data = data[offset:]
+
+            # Atributo: name-length
+            if offset + 2 > len(data):
+                logger.debug("Datos insuficientes para name-length")
                 break
-            
-            # Parse attribute (RFC 8011 compliant)
-            if offset + 2 >= len(data):
-                logger.debug(f"Not enough data for attribute at offset {offset}")
-                break
-                
             name_length = int.from_bytes(data[offset:offset+2], 'big')
             offset += 2
-            
-            # RFC 8011: Si name_length == 0, usar el último attribute-name válido
+
+            # Nombre del atributo
             if name_length == 0:
-                if last_attribute_name is None:
-                    logger.warning(f"name_length == 0 but no previous attribute name available")
-                    # Intentar continuar saltando este atributo mal formado
-                    if offset + 2 <= len(data):
-                        value_length = int.from_bytes(data[offset:offset+2], 'big')
-                        offset += 2 + value_length
-                    continue
-                name = last_attribute_name
-                logger.debug(f"Using previous attribute name: {name}")
-            else:
-                if offset + name_length >= len(data):
-                    logger.debug(f"Insufficient data for attribute name at offset {offset}, need {name_length} bytes")
+                if not last_attribute_name:
+                    logger.debug("attribute-name vacío sin previo válido")
                     break
-                    
-                name = data[offset:offset+name_length].decode('utf-8', errors='ignore')
+                name = last_attribute_name
+            else:
+                if offset + name_length > len(data):
+                    logger.debug("Datos insuficientes para attribute-name")
+                    break
+                name = data[offset:offset+name_length].decode('utf-8', errors='replace')
                 offset += name_length
-                last_attribute_name = name  # Guardar para posibles valores múltiples
-            
-            if offset + 2 >= len(data):
-                logger.debug(f"No space for value length after attribute '{name}'")
+                last_attribute_name = name
+
+            # value-length
+            if offset + 2 > len(data):
+                logger.debug("Datos insuficientes para value-length")
                 break
-                
             value_length = int.from_bytes(data[offset:offset+2], 'big')
             offset += 2
-            
+
             if offset + value_length > len(data):
-                logger.debug(f"Insufficient data for attribute '{name}' value, need {value_length} bytes")
+                logger.debug("Datos insuficientes para valor de atributo")
                 break
-                
             value_data = data[offset:offset+value_length]
             offset += value_length
-            
-            # Store attribute
+
             attr_value = AttributeValue(tag, value_data)
             attr_count += 1
-            
-            # Para atributos con valores múltiples, podríamos convertirlos en listas
-            # Por ahora, simplemente sobrescribimos (último valor gana)
+
             if current_group == 'operation':
                 _store_attribute(message.operation_attributes, name, attr_value)
             elif current_group == 'job':
                 _store_attribute(message.job_attributes, name, attr_value)
             elif current_group == 'printer':
                 _store_attribute(message.printer_attributes, name, attr_value)
-                
-            if attr_count <= 10:  # Log first 10 attributes for debugging
-                logger.debug(f"Parsed attribute: {name} = {attr_value.value} (tag: 0x{tag:02x})")
-        
-        logger.debug(f"✅ Parsing complete: {attr_count} attributes, "
-                    f"operation_id=0x{message.operation_id:04x}")
-        
+
+            if attr_count <= 10:
+                logger.debug(f"Attr[{attr_count}] {name} (tag=0x{tag:02x}, len={value_length})")
+
+        logger.debug(
+            f"✅ Parseo completo: {attr_count} atributos, operation_id=0x{message.operation_id:04x}"
+        )
+
     except Exception as e:
-        logger.error(f"❌ Error parsing IPP request: {e}")
-        import traceback
-        logger.debug(f"Parser error traceback: {traceback.format_exc()}")
-    
+        logger.error(f"❌ Error parseando solicitud IPP: {e}")
+        logger.debug(f"Traza del error del analizador: {traceback.format_exc()}")
+
     return message
 
+
+# Encapsula un valor de atributo IPP con su tipo y datos binarios
+# Proporciona conversión automática según el tipo de tag IPP
 class AttributeValue:
-    
+
     def __init__(self, tag: int, data: bytes):
         self.tag = tag
         self.data = data
         
     @property
     def value(self):
+
         if self.tag in [0x21, 0x23]:  # integer, enum
             if len(self.data) == 4:
                 return int.from_bytes(self.data, 'big')
@@ -231,6 +225,9 @@ class AttributeValue:
             return len(self.data) > 0 and self.data[0] != 0
         return self.data
 
+
+# Servidor IPP que maneja operaciones de impresión según RFC 8011
+# Soporta Print-Job, Get-Printer-Attributes, Get-Jobs y Validate-Job
 class IPPServer:
 
     SUPPORTED_OPERATIONS = {
@@ -242,154 +239,93 @@ class IPPServer:
     }
     
     def __init__(self, printer_backend=None, converter=None):
- 
+
         import time
+        
         self.printer_backend = printer_backend
         self.converter = converter
-        self.server = None
-        self.host = None
-        self.port = None
-        self.requested_port = None
-        self.port_manager = PortManager()
-        self._start_time = time.time()  # For printer-up-time attribute
-        
-        # Job management
-        self.active_jobs = {}
-        self.completed_jobs = []
-        self.failed_jobs = []
-        self.job_counter = 1
-        self.job_retention_seconds = 300  # Mantener jobs completados por 5 minutos
-        
-        # Server state
         self.is_running = False
         self.start_time = None
-
-        # Solo AGREGAR estas líneas al final del __init__ existente:
+        
+        # Estadísticas de conexiones para monitoreo
         self.connection_stats = {
             'total_connections': 0,
-            'probe_connections': 0,
+            'probe_connections': 0, 
             'valid_connections': 0,
             'cups_connections': 0,
             'android_connections': 0
-}
+        }
     
+    # Detecta conexiones de prueba de CUPS para filtrar logs innecesarios
     def _is_cups_probe_connection(self, client_ip: str, had_data: bool, request_count: int) -> bool:
-        """
-        Detecta si una conexión es un CUPS probe que debe ignorarse en logs.
-        
-        CUPS hace múltiples conexiones simultáneas para discovery:
-        - Algunas nunca envían datos (pure probes)
-        - Otras envían OPTIONS/HEAD y cierran inmediatamente
-        
-        Args:
-            client_ip: IP del cliente
-            had_data: Si la conexión recibió algún dato
-            request_count: Número de requests procesadas
-            
-        Returns:
-            True si es una conexión probe que debe ignorarse
-        """
-        # Localhost sin datos = probe
+
+        # Localhost sin datos = sondeo
         if client_ip == '127.0.0.1' and not had_data:
             return True
-        
-        # Localhost con solo 1 request corto = probe
+        # Localhost con solo 1 request corto = sondeo
         if client_ip == '127.0.0.1' and request_count == 1:
             return True
-        
-        # Red local con timeout inmediato = probe
+        # Red 10.x con timeout inmediato = sondeo
         if client_ip.startswith('10.') and not had_data:
             return True
-        
         return False
-    
+
+    # Calcula timeout adaptativo según tipo de cliente y número de request
     def _get_adaptive_timeout(self, request_count: int, is_android: bool) -> float:
-        """
-        Calcula timeout adaptativo basado en tipo de cliente y número de request.
-        
-        CUPS hace probes rápidos, Android necesita más tiempo para renderizar.
-        
-        Args:
-            request_count: Número de request actual
-            is_android: Si el cliente es Android
-            
-        Returns:
-            Timeout en segundos
-        """
+
         if request_count == 1:
-            # Primera request: timeout corto para detectar probes
-            return 2.0
-        
-        # Requests subsecuentes: más tiempo según cliente
+            return 2.0  # Primera request: corto para detectar sondeos
         return 5.0 if is_android else 10.0
     
+    # Determina si una conexión debe registrarse en logs para evitar spam
     def _should_log_connection(self, client_ip: str, method: str = None, 
                               request_count: int = 0, had_data: bool = False) -> bool:
-        """
-        Determina si una conexión/request debe loguearse para evitar spam.
-        
-        Args:
-            client_ip: IP del cliente
-            method: Método HTTP (GET, POST, etc.)
-            request_count: Número de request
-            had_data: Si hubo datos en la conexión
-            
-        Returns:
-            True si debe loguearse
-        """
-        # Siempre loguear POST (requests reales)
+
+        # Siempre registrar POST (requests reales)
         if method == 'POST':
             return True
         
-        # Siempre loguear primera request con datos
+        # Siempre registrar primera request con datos
         if request_count == 1 and had_data:
             return True
         
-        # Loguear GET importantes
+        # Registrar GET importantes
         if method == 'GET' and request_count <= 2:
             return True
         
-        # No loguear probes de CUPS
+        # No registrar sondeos de CUPS
         if self._is_cups_probe_connection(client_ip, had_data, request_count):
             return False
         
-        # No loguear OPTIONS/HEAD repetitivos de localhost
+        # No registrar OPTIONS/HEAD repetitivos de localhost
         if client_ip == '127.0.0.1' and method in ['OPTIONS', 'HEAD'] and request_count > 1:
             return False
         
         return True
     
+    # Establece límites de requests por conexión según tipo de cliente
     def _get_max_requests_per_connection(self, client_type: str) -> int:
-        """
-        Determina el máximo de requests permitidas por conexión según tipo de cliente.
-        
-        CUPS raramente usa más de 5-10 requests.
-        Android puede hacer muchas más.
-        
-        Args:
-            client_type: 'cups/linux' o 'android'
-            
-        Returns:
-            Número máximo de requests
-        """
+
         if client_type == "cups/linux":
             return 10
         elif client_type == "android":
             return 100
         else:
-            return 50  # Default conservador
+            return 50  # Valor por defecto conservador
 
+    # Detecta si un cliente es Android basándose en patrones de IP conocidos
     def _is_android_client(self, client_ip: str) -> bool:
-        """Check if client is in Android/mobile IP patterns for enhanced debugging"""
+
         android_ip_patterns = [
             "192.168.1.121",
-            "192.168.1.122",
+            "192.168.1.122", 
             "192.168.1.123",
         ]
         
-        # Could also check user agent if available, but for now use IP
+        # También se podría verificar user agent si está disponible
         return client_ip in android_ip_patterns
 
+    # Inicia el servidor IPP en el host y puerto especificados
     async def start(self, host: str = '0.0.0.0', port: int = 631):
 
         self.host = host
@@ -398,7 +334,7 @@ class IPPServer:
         # Intentar obtener el puerto solicitado
         available_port = await self._get_available_port(port)
         if not available_port:
-            raise RuntimeError(f"No available ports found starting from {port}")
+            raise RuntimeError(f"No se encontraron puertos disponibles desde {port}")
         
         self.port = available_port
         
@@ -416,50 +352,51 @@ class IPPServer:
             self.is_running = True
             self.start_time = datetime.now()
             
-            logger.info(f"✅ IPP server started on {host}:{available_port}")
+            logger.info(f"✅ Servidor IPP iniciado en {host}:{available_port}")
             
             # Mostrar información de conexión
             network_info = self.port_manager.get_network_info()
             if network_info['local_ip'] != 'localhost':
-                logger.info(f"📡 External access: ipp://{network_info['local_ip']}:{available_port}/ipp/printer")
+                logger.info(f"📡 Acceso externo: ipp://{network_info['local_ip']}:{available_port}/ipp/printer")
             
             if available_port != port:
-                logger.warning(f"⚠️  Port {port} was not available, using {available_port}")
+                logger.warning(f"⚠️  Puerto {port} no disponible, usando {available_port}")
                 
         except Exception as e:
-            logger.error(f"Failed to start IPP server: {e}")
+            logger.error(f"❌ Error iniciando servidor IPP: {e}")
             raise
     
+    # Busca un puerto disponible, intentando liberar el preferido si está ocupado
     async def _get_available_port(self, preferred_port: int) -> Optional[int]:
 
         # 1. Verificar si el puerto preferido está disponible
         if self.port_manager.is_port_available(preferred_port):
-            logger.info(f"✅ Port {preferred_port} is available")
+            logger.info(f"✅ Puerto {preferred_port} está disponible")
             return preferred_port
         
         # 2. Verificar qué proceso usa el puerto
         processes = self.port_manager.get_process_using_port(preferred_port)
         if processes:
-            logger.warning(f"🚫 Port {preferred_port} is occupied by:")
+            logger.warning(f"🚫 Puerto {preferred_port} está ocupado por:")
             for proc in processes:
-                logger.warning(f"   - {proc.get('name', 'Unknown')} (PID: {proc.get('pid', 'Unknown')})")
+                logger.warning(f"   - {proc.get('name', 'Desconocido')} (PID: {proc.get('pid', 'Desconocido')})")
             
             # 3. Si es CUPS, intentar detenerlo (solo en puerto 631)
             if preferred_port == 631:
                 cups_detected = any('cups' in proc.get('name', '').lower() for proc in processes)
                 if cups_detected:
-                    logger.info("🔄 Attempting to stop CUPS service...")
+                    logger.info("🔄 Intentando detener servicio CUPS...")
                     if self.port_manager.stop_service_on_port(preferred_port):
                         # Esperar un momento y verificar de nuevo
                         await asyncio.sleep(2)
                         if self.port_manager.is_port_available(preferred_port):
-                            logger.info(f"✅ Successfully freed port {preferred_port}")
+                            logger.info(f"✅ Puerto {preferred_port} liberado exitosamente")
                             return preferred_port
                         else:
-                            logger.warning("❌ Failed to free port after stopping CUPS")
+                            logger.warning("❌ No se pudo liberar el puerto después de detener CUPS")
         
         # 4. Buscar puerto alternativo
-        logger.info("🔍 Searching for alternative port...")
+        logger.info("🔍 Buscando puerto alternativo...")
         alternative_port = self.port_manager.find_available_port(
             preferred_port=None,
             start_range=8631 if preferred_port == 631 else preferred_port + 1,
@@ -467,43 +404,44 @@ class IPPServer:
         )
         
         if alternative_port:
-            logger.info(f"✅ Found alternative port: {alternative_port}")
+            logger.info(f"✅ Puerto alternativo encontrado: {alternative_port}")
             return alternative_port
         
         # 5. Como último recurso, intentar puertos estándar
-        logger.warning("⚠️  No ports in normal range, trying standard ports...")
+        logger.warning("⚠️  No hay puertos en rango normal, probando puertos estándar...")
         for test_port in [8631, 9100, 9101, 8632, 8633]:
             if test_port != preferred_port and self.port_manager.is_port_available(test_port):
-                logger.info(f"✅ Found fallback port: {test_port}")
+                logger.info(f"✅ Puerto de respaldo encontrado: {test_port}")
                 return test_port
         
-        logger.error("❌ No available ports found")
+        logger.error("❌ No se encontraron puertos disponibles")
         return None
     
+    # Maneja conexiones de clientes IPP con soporte para múltiples requests  
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+
         client_addr = writer.get_extra_info('peername')
-        client_ip = client_addr[0] if client_addr else "unknown"
+        client_ip = client_addr[0] if client_addr else "desconocido"
         
-        # Get socket info for better diagnostics
+        # Obtener información del socket para mejor diagnóstico
         try:
             socket_info = writer.get_extra_info('socket')
-            logger.debug(f"New connection from {client_addr} (socket: {socket_info})")
+            logger.debug(f"Nueva conexión desde {client_addr} (socket: {socket_info})")
         except:
-            logger.debug(f"New connection from {client_addr}")
+            logger.debug(f"Nueva conexión desde {client_addr}")
         
-        # Detect client type (Android, Linux CUPS, etc)
+        # Detectar tipo de cliente (Android, CUPS Linux, etc)
         is_android = self._is_android_client(client_ip)
         client_type = "android" if is_android else "cups/linux"
         
-        # ===== FIX 1: Timeout adaptativo más agresivo =====
-        # CUPS hace muchas conexiones probe que cierran inmediatamente
-        # Reducir timeout inicial para detectar estas conexiones rápido
+        # Timeout adaptativo más agresivo para detectar sondeos rápidamente
+        # CUPS hace muchas conexiones de prueba que se cierran inmediatamente
         initial_timeout = 2.0  # 2 segundos en lugar de 30
-        request_timeout = 5.0 if is_android else 10.0  # Timeout para requests subsecuentes
+        request_timeout = 5.0 if is_android else 10.0  # Timeout para requests posteriores
         
-        # Initialize debugging session
+        # Inicializar sesión de depuración
         if DEBUG_ENABLED:
-            log_android_debug(client_ip, f"New connection from {client_type}", {
+            log_android_debug(client_ip, f"Nueva conexión desde {client_type}", {
                 'client_addr': str(client_addr),
                 'client_type': client_type
             })
@@ -511,22 +449,22 @@ class IPPServer:
         try:
             # Loop para soportar múltiples requests en la misma conexión (CUPS)
             request_count = 0
-            connection_had_data = False  # Track if we ever received real data
+            connection_had_data = False  # Rastrear si alguna vez recibimos datos reales
             
             while True:
                 request_count += 1
                 
-                # ===== FIX 2: Timeout diferenciado para primera request =====
-                # Primera request: timeout corto para detectar probes
-                # Requests subsecuentes: timeout normal
+                # Timeout diferenciado para primera request vs. posteriores
+                # Primera request: timeout corto para detectar sondeos
+                # Requests posteriores: timeout normal
                 if request_count == 1:
                     timeout_duration = initial_timeout
                 else:
                     timeout_duration = request_timeout
                 
-                # Solo logear primera request para evitar spam
+                # Solo registrar primera request para evitar spam de logs
                 if request_count == 1 or connection_had_data:
-                    logger.debug(f"[{client_ip}] Waiting for request #{request_count} (timeout: {timeout_duration}s)")
+                    logger.debug(f"[{client_ip}] Esperando solicitud #{request_count} (timeout: {timeout_duration}s)")
                 
                 try:
                     request_line = await asyncio.wait_for(
@@ -534,40 +472,39 @@ class IPPServer:
                         timeout=timeout_duration
                     )
                 except asyncio.TimeoutError:
-                    # ===== FIX 3: Manejo silencioso de probe connections =====
-                    # CUPS hace muchas conexiones probe que nunca envían datos
-                    # Solo logear si la conexión tuvo actividad previa
+                    # Manejo silencioso de conexiones de sondeo
+                    # CUPS hace muchas conexiones de prueba que nunca envían datos
+                    # Solo registrar si la conexión tuvo actividad previa
                     if connection_had_data:
-                        logger.debug(f"[{client_ip}] Connection timeout after {timeout_duration}s without request line.")
-                    # No logear nada para probes vacíos (reduce spam)
+                        logger.debug(f"[{client_ip}] Timeout de conexión después de {timeout_duration}s sin línea de solicitud.")
+                    # No registrar nada para sondeos vacíos (reduce spam)
                     break
                 
                 # EOF / cierre del cliente
                 if not request_line:
-                    # ===== FIX 4: Logging condicional de EOF =====
-                    # Solo loguear EOF si hubo requests válidas anteriormente
+                    # Solo registrar EOF si hubo requests válidas anteriormente
                     if connection_had_data:
-                        logger.debug(f"[{client_ip}] EOF received from client (connection closed)")
+                        logger.debug(f"[{client_ip}] EOF recibido del cliente (conexión cerrada)")
                     break
                 
                 # Marcar que esta conexión tuvo datos
                 connection_had_data = True
                 
-                # TCP probe vacío (mantener conexión)
+                # Sondeo TCP vacío (mantener conexión)
                 if len(request_line.strip()) == 0:
-                    logger.debug(f"[{client_ip}] Empty probe received, continuing...")
+                    logger.debug(f"[{client_ip}] Sondeo vacío recibido, continuando...")
                     await asyncio.sleep(0.5)
                     continue
                 
-                # Log request line (solo si hay datos reales)
+                # Registrar línea de request (solo si hay datos reales)
                 raw_request_line = request_line[:100]
-                logger.debug(f"[{client_ip}] Request line: {raw_request_line}")
+                logger.debug(f"[{client_ip}] Línea de solicitud: {raw_request_line}")
                 
-                # === DETECCIÓN DE RAW DATA (PDF/ESC/POS directo sin HTTP wrapper) ===
+                # DETECCIÓN DE DATOS CRUDOS (PDF/ESC/POS directo sin wrapper HTTP)
                 # Algunos clientes Android/iOS envían el documento directamente
                 if request_line.startswith(b'%PDF') or request_line.startswith(b'\x1b'):
-                    logger.info(f"📄 [Android/iOS] Raw document detected from {client_ip}")
-                    logger.info(f"📄 Document type: {'PDF' if request_line.startswith(b'%PDF') else 'ESC/POS'}")
+                    logger.info(f"📄 [Android/iOS] Documento crudo detectado desde {client_ip}")
+                    logger.info(f"📄 Tipo de documento: {'PDF' if request_line.startswith(b'%PDF') else 'ESC/POS'}")
                     
                     # Leer todo el documento
                     document_data = request_line
@@ -580,7 +517,7 @@ class IPPServer:
                         except asyncio.TimeoutError:
                             break
                     
-                    logger.info(f"📄 Received raw document: {len(document_data)} bytes")
+                    logger.info(f"📄 Documento crudo recibido: {len(document_data)} bytes")
                     
                     # Procesar el documento directamente
                     try:
@@ -589,20 +526,20 @@ class IPPServer:
                             from .converter import DocumentConverter
                             converter = DocumentConverter()
                             escpos_data = await converter.convert_to_escpos(document_data, 'application/pdf')
-                            logger.info(f"✅ PDF converted to ESC/POS: {len(escpos_data)} bytes")
+                            logger.info(f"✅ PDF convertido a ESC/POS: {len(escpos_data)} bytes")
                         else:
                             # Ya es ESC/POS, usar directamente
                             escpos_data = document_data
-                            logger.info(f"✅ ESC/POS data received: {len(escpos_data)} bytes")
+                            logger.info(f"✅ Datos ESC/POS recibidos: {len(escpos_data)} bytes")
                         
                         # Enviar a la impresora
                         if self.printer_backend and hasattr(self.printer_backend, 'is_connected'):
                             if self.printer_backend.is_connected:
                                 success = await self.printer_backend.send_raw(escpos_data)
                                 if success:
-                                    logger.info(f"✅ Printed successfully: {len(escpos_data)} bytes sent to printer")
+                                    logger.info(f"✅ Impresión exitosa: {len(escpos_data)} bytes enviados a impresora")
                                 else:
-                                    logger.error("❌ Failed to print document")
+                                    logger.error("❌ Error al imprimir documento")
                                 
                                 # Enviar respuesta simple (algunos clientes no esperan respuesta)
                                 try:
@@ -615,10 +552,10 @@ class IPPServer:
                                 except:
                                     pass  # Cliente puede haber cerrado conexión
                             else:
-                                logger.error("❌ Printer not connected")
+                                logger.error("❌ Impresora no conectada")
                         
                     except Exception as e:
-                        logger.error(f"❌ Error processing raw document: {e}")
+                        logger.error(f"❌ Error procesando documento crudo: {e}")
                         import traceback
                         logger.debug(traceback.format_exc())
                     
@@ -672,7 +609,7 @@ class IPPServer:
                         v_stripped = v.strip()
                         headers[k_lower] = v_stripped
                         
-                        # Parse specific headers
+                        # Parsear headers específicos
                         if k_lower == 'content-length':
                             try:
                                 content_length = int(v_stripped)
@@ -685,34 +622,36 @@ class IPPServer:
                         elif k_lower == 'connection':
                             connection_type = v_stripped.lower()
                 
-                # ===== FIX 5: Keep-Alive más conservador para CUPS =====
+                # Keep-Alive más conservador para CUPS
                 # CUPS a veces envía Connection: close pero espera keep-alive
                 # Ser más permisivo con HTTP/1.1
                 if version == "HTTP/1.1":
+
                     # HTTP/1.1: Keep-Alive por defecto UNLESS explícitamente close
                     keep_alive = (connection_type != 'close')
+
                     # Pero si es CUPS local, siempre cerrar después de OPTIONS/HEAD
                     if client_ip == '127.0.0.1' and method in ['OPTIONS', 'HEAD']:
                         keep_alive = False
-                else:  # HTTP/1.0
+                else:
                     keep_alive = (connection_type == 'keep-alive')
                 
-                logger.debug(f"[{client_ip}] Keep-Alive: {keep_alive} (Connection: {connection_type}, Version: {version})")
+                logger.debug(f"[{client_ip}] Keep-Alive: {keep_alive} (Conexión: {connection_type}, Versión: {version})")
                 
-                # Handle Expect: 100-continue
+                # Manejar Expect: 100-continue
                 if expect_continue:
-                    logger.debug(f"[{client_ip}] Sending 100 Continue")
+                    logger.debug(f"[{client_ip}] Enviando 100 Continue")
                     writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
                     await writer.drain()
                 
-                # Log request (solo requests con datos reales)
-                logger.info(f"📨 [{client_ip}] {method} {path} {version} (request #{request_count})")
+                # Registrar request (solo requests con datos reales)
+                logger.info(f"📨 [{client_ip}] {method} {path} {version} (solicitud #{request_count})")
                 
-                # Logging condicional de headers (solo primeras 5)
+                # Logging condicional de headers (solo primeros 5)
                 if request_count <= 3 or content_length > 0:
                     logger.debug(f"[{client_ip}] Headers: {dict(list(headers.items())[:5])}...")
                 
-                # === ROUTING DE REQUESTS ===
+                # ENRUTAMIENTO DE REQUESTS
                 
                 if method == 'OPTIONS':
                     await self._handle_options_request(writer, path, keep_alive)
@@ -736,41 +675,41 @@ class IPPServer:
                     )
                     
                 else:
-                    logger.warning(f"[{client_ip}] Unhandled request: {method} {path}")
-                    await self._send_http_error(writer, 404, "Not Found", keep_alive)
+                    logger.warning(f"[{client_ip}] Solicitud no manejada: {method} {path}")
+                    await self._send_http_error(writer, 404, "No Encontrado", keep_alive)
                 
                 # Si el cliente pidió cerrar conexión, salir del loop
                 if not keep_alive:
-                    logger.debug(f"[{client_ip}] Client requested connection close, exiting loop")
+                    logger.debug(f"[{client_ip}] Cliente solicitó cierre de conexión, saliendo del bucle")
                     break
                 
-                # ===== FIX 6: Límite de requests más conservador para CUPS =====
+                # Límite de requests más conservador para CUPS
                 # CUPS raramente usa más de 5-10 requests por conexión
                 max_requests = 10 if client_type == "cups/linux" else 100
                 if request_count >= max_requests:
-                    logger.info(f"[{client_ip}] Max requests per connection reached ({max_requests}), closing")
+                    logger.info(f"[{client_ip}] Máximo de requests por conexión alcanzado ({max_requests}), cerrando")
                     break
             
-            # ===== FIX 7: Logging resumido de cierre de conexión =====
-            # Solo loguear si hubo requests válidas
+            # Logging resumido de cierre de conexión
+            # Solo registrar si hubo requests válidas
             if connection_had_data and request_count > 1:
-                logger.debug(f"[{client_ip}] Connection closed after {request_count} requests")
+                logger.debug(f"[{client_ip}] Conexión cerrada después de {request_count} solicitudes")
             
         except ConnectionResetError as e:
-            # Cliente cerró abruptamente; esto es normal para CUPS probes
+            # Cliente cerró abruptamente; esto es normal para sondeos de CUPS
             if connection_had_data:
-                logger.debug(f"[{client_ip}] Connection reset by peer: {e}")
-            # No logear nada para probes que nunca enviaron datos
+                logger.debug(f"[{client_ip}] Conexión reiniciada por el par: {e}")
+            # No registrar nada para sondeos que nunca enviaron datos
             
         except Exception as e:
-            # Solo logear excepciones de conexiones que tuvieron datos
+            # Solo registrar excepciones de conexiones que tuvieron datos
             if connection_had_data:
-                logger.error(f"[{client_ip}] Error handling client: {e}")
+                logger.error(f"[{client_ip}] Error manejando cliente: {e}")
                 import traceback
-                logger.debug(f"Client handler error traceback:\n{traceback.format_exc()}")
+                logger.debug(f"Traza del error del manejador de cliente:\n{traceback.format_exc()}")
             
             try:
-                await self._send_http_error(writer, 500, "Internal Server Error", keep_alive=False)
+                await self._send_http_error(writer, 500, "Error Interno del Servidor", keep_alive=False)
             except:
                 pass
         finally:
@@ -780,36 +719,35 @@ class IPPServer:
             except:
                 pass
 
+    # Maneja requests IPP específicas con parseo de mensajes y enrutamiento de operaciones
     async def _handle_ipp_request(self, reader: asyncio.StreamReader, 
                             writer: asyncio.StreamWriter, headers: dict, 
                             client_ip: str = None, content_length: int = 0,
                             transfer_encoding: str = None, keep_alive: bool = False):
-        """
-        REEMPLAZAR el método _handle_ipp_request con esta versión optimizada
-        """
+
         client_addr = writer.get_extra_info('peername')
         if not client_ip:
-            client_ip = client_addr[0] if client_addr else "unknown"
+            client_ip = client_addr[0] if client_addr else "desconocido"
         
         try:
-            user_agent = headers.get('user-agent', 'unknown')
+            user_agent = headers.get('user-agent', 'desconocido')
             
-            # Logging condicional: solo para debug detallado
+            # Logging condicional: solo para depuración detallada
             is_cups = 'CUPS' in user_agent
             should_log_detail = not is_cups or content_length > 0
             
             if should_log_detail:
-                logger.info(f"📱 Client: {user_agent} from {client_ip}")
+                logger.info(f"📱 Cliente: {user_agent} desde {client_ip}")
             
-            # CUPS handshake logging (solo si no es Android)
+            # Logging de handshake CUPS (solo si no es Android)
             if not self._is_android_client(client_ip) and should_log_detail:
-                self._log_cups_handshake(client_ip, "IPP Request Received", headers)
+                self._log_cups_handshake(client_ip, "Request IPP Recibida", headers)
             
-            # Read body data
+            # Leer datos del cuerpo
             ipp_data = b''
             
             if transfer_encoding == 'chunked':
-                # Chunked transfer
+                # Transferencia fragmentada
                 chunks = []
                 total_size = 0
                 
@@ -821,94 +759,94 @@ class IPPServer:
                     try:
                         chunk_size = int(chunk_size_line.strip(), 16)
                     except ValueError:
-                        logger.error(f"[{client_ip}] Invalid chunk size")
+                        logger.error(f"[{client_ip}] Tamaño de fragmento inválido")
                         break
                     
                     if chunk_size == 0:
-                        await reader.readline()  # Read final CRLF
+                        await reader.readline()  # Leer CRLF final
                         break
                     
                     chunk_data = await reader.readexactly(chunk_size)
                     chunks.append(chunk_data)
                     total_size += chunk_size
-                    await reader.readline()  # Read trailing CRLF
+                    await reader.readline()  # Leer CRLF final
                 
                 ipp_data = b''.join(chunks)
                 if should_log_detail:
-                    logger.info(f"✅ Chunked transfer: {len(ipp_data)} bytes")
+                    logger.info(f"✅ Transferencia fragmentada: {len(ipp_data)} bytes")
                     
             elif content_length > 0:
-                # Fixed Content-Length
+                # Content-Length fijo
                 try:
                     ipp_data = await asyncio.wait_for(
                         reader.read(content_length),
                         timeout=30.0  # Timeout para lecturas grandes
                     )
                 except asyncio.TimeoutError:
-                    logger.error(f"[{client_ip}] Timeout reading {content_length} bytes")
-                    await self._send_http_error(writer, 408, "Request Timeout", keep_alive=False)
+                    logger.error(f"[{client_ip}] Timeout leyendo {content_length} bytes")
+                    await self._send_http_error(writer, 408, "Timeout de Solicitud", keep_alive=False)
                     return
             else:
-                # No explicit length - try to read with timeout
+                # Sin longitud explícita - intentar leer con timeout
                 try:
                     ipp_data = await asyncio.wait_for(
-                        reader.read(10 * 1024 * 1024),  # Max 10MB
+                        reader.read(10 * 1024 * 1024),  # Máximo 10MB
                         timeout=5.0
                     )
                 except asyncio.TimeoutError:
-                    logger.warning(f"[{client_ip}] No data received (timeout)")
-                    await self._send_http_error(writer, 400, "No content", keep_alive=False)
+                    logger.warning(f"[{client_ip}] No se recibieron datos (timeout)")
+                    await self._send_http_error(writer, 400, "Sin contenido", keep_alive=False)
                     return
             
-            # Validate data
+            # Validar datos
             if not ipp_data or len(ipp_data) == 0:
-                logger.warning(f"[{client_ip}] No IPP data received")
-                await self._send_http_error(writer, 400, "No content", keep_alive=False)
+                logger.warning(f"[{client_ip}] No se recibieron datos IPP")
+                await self._send_http_error(writer, 400, "Sin contenido", keep_alive=False)
                 return
             
             actual_length = len(ipp_data)
             
             # Logging condicional del tamaño
             if should_log_detail:
-                logger.info(f"✅ Received {actual_length} bytes from {client_ip}")
+                logger.info(f"✅ Recibidos {actual_length} bytes desde {client_ip}")
             
-            # Save for debugging (solo Android o errores)
+            # Guardar para depuración (solo Android o errores)
             if DEBUG_ENABLED and (self._is_android_client(client_ip) or actual_length < 100):
                 save_request_data(client_ip, ipp_data, headers, "/ipp/printer")
             
-            # Validate minimum IPP header
+            # Validar encabezado IPP mínimo
             if actual_length < 8:
-                logger.error(f"[{client_ip}] IPP data too short: {actual_length} bytes")
-                await self._send_http_error(writer, 400, "Invalid IPP data", keep_alive=False)
+                logger.error(f"[{client_ip}] Datos IPP demasiado cortos: {actual_length} bytes")
+                await self._send_http_error(writer, 400, "Datos IPP inválidos", keep_alive=False)
                 return
             
-            # Parse IPP message
+            # Parsear mensaje IPP
             message = parse_ipp_request(ipp_data)
             
             if message.operation_id is None:
-                logger.error(f"[{client_ip}] Failed to parse IPP operation")
-                await self._send_http_error(writer, 400, "Invalid IPP message", keep_alive=False)
+                logger.error(f"[{client_ip}] Error al parsear operación IPP")
+                await self._send_http_error(writer, 400, "Mensaje IPP inválido", keep_alive=False)
                 return
             
-            # Log operation
+            # Registrar operación
             operation_name = self.SUPPORTED_OPERATIONS.get(
                 message.operation_id, 
-                f'Unknown-0x{message.operation_id:04x}'
+                f'Desconocida-0x{message.operation_id:04x}'
             )
             
-            # Solo loguear operaciones importantes
+            # Solo registrar operaciones importantes
             if message.operation_id != 0x000b or should_log_detail:  # 0x000b = Get-Printer-Attributes
-                logger.info(f"🔧 {operation_name} from {client_ip}")
+                logger.info(f"🔧 {operation_name} desde {client_ip}")
             
-            # Process operation
+            # Procesar operación
             response_data = await self._process_ipp_operation(message, client_ip)
             
             if not response_data:
-                logger.error(f"[{client_ip}] No response generated")
-                await self._send_http_error(writer, 500, "Processing failed", keep_alive=False)
+                logger.error(f"[{client_ip}] No se generó respuesta")
+                await self._send_http_error(writer, 500, "Error de procesamiento", keep_alive=False)
                 return
             
-            # Send response
+            # Enviar respuesta
             ipp_version = f"{message.version_number[0]}.{message.version_number[1]}"
             
             response_headers = (
@@ -916,7 +854,7 @@ class IPPServer:
                 "Content-Type: application/ipp\r\n"
                 f"Content-Length: {len(response_data)}\r\n"
                 f"Server: IPP/{ipp_version}\r\n"
-                "Content-Language: en\r\n"
+                "Content-Language: es\r\n"
                 "Date: " + datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT') + "\r\n"
                 f"Connection: {'keep-alive' if keep_alive else 'close'}\r\n"
             )
@@ -933,70 +871,71 @@ class IPPServer:
                 
                 # Logging condicional de éxito
                 if should_log_detail or len(response_data) > 5000:
-                    logger.info(f"✅ Response sent to {client_ip}: {len(response_data)} bytes")
+                    logger.info(f"✅ Respuesta enviada a {client_ip}: {len(response_data)} bytes")
                 
             except (ConnectionResetError, BrokenPipeError) as e:
-                logger.debug(f"[{client_ip}] Connection closed during send: {e}")
+                logger.debug(f"[{client_ip}] Conexión cerrada durante envío: {e}")
                 return
             
         except Exception as e:
-            logger.error(f"[{client_ip}] IPP request error: {e}")
+            logger.error(f"[{client_ip}] Error en solicitud IPP: {e}")
             import traceback
             logger.debug(traceback.format_exc())
             try:
-                await self._send_http_error(writer, 500, "IPP Error", keep_alive=False)
+                await self._send_http_error(writer, 500, "Error IPP", keep_alive=False)
             except:
                 pass
     
+    # Procesa operación IPP específica y genera respuesta apropiada
     async def _process_ipp_operation(self, message: IPPMessage, client_ip: str = None) -> bytes:
-        """Process IPP operation"""
+
         try:
-            operation_name = self.SUPPORTED_OPERATIONS.get(message.operation_id, 'Unknown')
-            logger.info(f"📱 Processing IPP operation: {operation_name} (0x{message.operation_id:04x})")
+            operation_name = self.SUPPORTED_OPERATIONS.get(message.operation_id, 'Desconocida')
+            logger.info(f"📱 Procesando operación IPP: {operation_name} (0x{message.operation_id:04x})")
             
-            # Enhanced debugging for Android compatibility
-            logger.debug(f"Request ID: {message.request_id}, Version: {message.version_number}")
+            # Depuración mejorada para compatibilidad con Android
+            logger.debug(f"ID de solicitud: {message.request_id}, Versión: {message.version_number}")
             if message.operation_attributes:
-                logger.debug(f"Operation attributes: {len(message.operation_attributes)} items")
+                logger.debug(f"Atributos de operación: {len(message.operation_attributes)} elementos")
                 shown = 0
                 for attr_name, attr_value in message.operation_attributes.items():
                     if shown >= 8:  # mostrar algunos más ahora que soportamos multi-valor
                         break
                     if isinstance(attr_value, list):
                         values = [v.value for v in attr_value]
-                        logger.debug(f"  Attribute: {attr_name}={values}")
+                        logger.debug(f"  Atributo: {attr_name}={values}")
                     else:
-                        logger.debug(f"  Attribute: {attr_name}={attr_value.value}")
+                        logger.debug(f"  Atributo: {attr_name}={attr_value.value}")
                     shown += 1
             
             if message.job_attributes:
-                logger.debug(f"Job attributes: {len(message.job_attributes)} items")
+                logger.debug(f"Atributos de trabajo: {len(message.job_attributes)} elementos")
                 for i, (attr_name, attr_value) in enumerate(message.job_attributes.items()):
                     if i >= 5:
                         break
-                    logger.debug(f"  Job Attr: {attr_name}={attr_value.value}")
+                    logger.debug(f"  Atrib. Trabajo: {attr_name}={attr_value.value}")
             
             if message.document_data:
-                logger.info(f"📄 Document data received: {len(message.document_data)} bytes")
-                # Log preview of document data
+                logger.info(f"📄 Datos de documento recibidos: {len(message.document_data)} bytes")
                 preview = message.document_data[:50] if len(message.document_data) >= 50 else message.document_data
-                logger.debug(f"Document preview (hex): {preview.hex()}")
+                logger.debug(f"Vista previa del documento (hex): {preview.hex()}")
             
-            # Process operation
+            # Procesar operación
             if message.operation_id == 0x0002:  # Print-Job
-                logger.debug("Routing to _handle_print_job")
+                logger.debug("Enrutando a _handle_print_job")
                 return await self._handle_print_job(message)
             elif message.operation_id == 0x000b:  # Get-Printer-Attributes
-                logger.debug("Routing to _handle_get_printer_attributes")
+                logger.debug("Enrutando a _handle_get_printer_attributes")
                 return await self._handle_get_printer_attributes(message)
             elif message.operation_id == 0x000a:  # Get-Jobs
-                logger.info(f"🔧 Get-Jobs from {client_ip}")
+                logger.info(f"🔧 Get-Jobs desde {client_ip}")
                 return await self._handle_get_jobs(message)
             elif message.operation_id == 0x0004:  # Validate-Job
-                logger.debug("Routing to _handle_validate_job")
+                logger.debug("Enrutando a _handle_validate_job")
                 return await self._handle_validate_job(message)
             elif message.operation_id == 0x0008:  # Cancel-Job
-                logger.debug("Routing to Cancel-Job handler")
+                logger.debug("Enrutando a manejador Cancel-Job")
+
                 # Intentar obtener job-id
                 job_id = None
                 if 'job-id' in message.operation_attributes:
@@ -1005,6 +944,7 @@ class IPPServer:
                         job_id = job_id_attr.value if isinstance(job_id_attr.value, int) else int(job_id_attr.value)
                     except Exception:
                         job_id = None
+
                 # Cancelar si existe
                 if job_id and job_id in self.active_jobs:
                     job = self.active_jobs[job_id]
@@ -1012,7 +952,8 @@ class IPPServer:
                     job['state_reasons'] = ['job-canceled-by-user']
                     self.failed_jobs.append(job)
                     self.active_jobs.pop(job_id, None)
-                    logger.info(f"🛑 Job {job_id} canceled")
+                    logger.info(f"🛑 Trabajo {job_id} cancelado")
+
                     # Respuesta mínima IPP
                     response = io.BytesIO()
                     response.write(bytes(message.version_number))  # Usar versión del cliente
@@ -1020,7 +961,7 @@ class IPPServer:
                     response.write(message.request_id.to_bytes(4,'big'))
                     response.write(bytes([0x01]))  # operation-attributes
                     self._write_attribute(response, 0x47, 'attributes-charset', 'utf-8')
-                    self._write_attribute(response, 0x48, 'attributes-natural-language', 'en-us')
+                    self._write_attribute(response, 0x48, 'attributes-natural-language', 'es-es')
                     response.write(bytes([0x02]))  # job-attributes
                     self._write_attribute(response, 0x21, 'job-id', job_id.to_bytes(4,'big'))
                     self._write_attribute(response, 0x23, 'job-state', (8).to_bytes(4,'big'))  # canceled/aborted
@@ -1028,41 +969,41 @@ class IPPServer:
                     response.write(bytes([0x03]))
                     return response.getvalue()
                 else:
-                    logger.warning("Cancel-Job requested for unknown job-id")
+                    logger.warning("Cancel-Job solicitado para job-id desconocido")
                     return self._create_error_response(message.request_id, 0x0405, message.version_number)  # client-error-not-found
             else:
-                logger.warning(f"❌ Unsupported IPP operation: 0x{message.operation_id:04x}")
+                logger.warning(f"❌ Operación IPP no soportada: 0x{message.operation_id:04x}")
                 return self._create_error_response(message.request_id, 0x0501, message.version_number)  # server-error-operation-not-supported
                 
         except Exception as e:
-            logger.error(f"❌ Error in _process_ipp_operation: {e}")
             import traceback
-            logger.debug(f"Operation processing error traceback: {traceback.format_exc()}")
+            logger.debug(f"Traza del error de procesamiento de operación: {traceback.format_exc()}")
             version = getattr(message, 'version_number', (2, 0))
             return self._create_error_response(getattr(message, 'request_id', 1), 0x0500, version)  # server-error-internal-error
     
+    # Maneja solicitudes de impresión (Print-Job) procesando documento y creando trabajo
     async def _handle_print_job(self, message: IPPMessage) -> bytes:
 
         try:
-            logger.info("🖨️  Handling Print-Job request")
+            logger.info("🖨️  Manejando solicitud Print-Job")
             
-            # Log all operation attributes for debugging
-            logger.debug("Operation attributes:")
+            # Registrar todos los atributos de operación para depuración
+            logger.debug("Atributos de operación:")
             for attr_name, attr_value in message.operation_attributes.items():
                 logger.debug(f"  {attr_name}: {attr_value.value}")
             
-            # Log job attributes
+            # Registrar atributos del trabajo
             if message.job_attributes:
-                logger.debug("Job attributes:")
+                logger.debug("Atributos del trabajo:")
                 for attr_name, attr_value in message.job_attributes.items():
                     logger.debug(f"  {attr_name}: {attr_value.value}")
             
-            # Validate document data
+            # Validar datos del documento
             if not message.document_data or len(message.document_data) == 0:
-                logger.error("❌ No document data received")
+                logger.error("❌ No se recibieron datos del documento")
                 return self._create_error_response(message.request_id, 0x0400, message.version_number)  # client-error-bad-request
             
-            # Get document format from operation attributes
+            # Obtener formato del documento de atributos de operación
             document_format = 'application/octet-stream'
             if 'document-format' in message.operation_attributes:
                 format_attr = message.operation_attributes['document-format']
@@ -1071,17 +1012,17 @@ class IPPServer:
                 else:
                     document_format = str(format_attr.value)
             
-            logger.info(f"📄 Print job details:")
-            logger.info(f"  - Format: {document_format}")
-            logger.info(f"  - Size: {len(message.document_data)} bytes")
-            logger.info(f"  - First bytes (hex): {message.document_data[:50].hex()}")
+            logger.info(f"📄 Detalles del trabajo de impresión:")
+            logger.info(f"  - Formato: {document_format}")
+            logger.info(f"  - Tamaño: {len(message.document_data)} bytes")
+            logger.info(f"  - Primeros bytes (hex): {message.document_data[:50].hex()}")
             
-            # Check if data looks like ESC/POS commands
+            # Verificar si los datos parecen comandos ESC/POS
             if message.document_data.startswith(b'\x1b') or b'\x1d' in message.document_data[:100]:
-                logger.info("  ✅ Document appears to contain ESC/POS commands")
+                logger.info("  ✅ El documento parece contener comandos ESC/POS")
             
-            # Get job name if available
-            job_name = "Unnamed Job"
+            # Obtener nombre del trabajo si está disponible
+            job_name = "Trabajo Sin Nombre"
             if 'job-name' in message.operation_attributes:
                 job_name_attr = message.operation_attributes['job-name']
                 if isinstance(job_name_attr.value, str):
@@ -1089,24 +1030,25 @@ class IPPServer:
                 elif isinstance(job_name_attr.value, bytes):
                     job_name = job_name_attr.value.decode('utf-8', errors='ignore')
             
-            logger.info(f"  - Job name: {job_name}")
+            logger.info(f"  - Nombre del trabajo: {job_name}")
             
-            # Create job
+            # Crear trabajo
             job_id = self._create_job(message)
-            logger.info(f"✅ Created job {job_id} for '{job_name}'")
+            logger.info(f"✅ Trabajo {job_id} creado para '{job_name}'")
             
-            # Process job asynchronously
+            # Procesar trabajo de forma asíncrona
             asyncio.create_task(self._process_print_job(job_id, message.document_data, document_format, job_name))
             
-            # Return success response
+            # Retornar respuesta de éxito
             return self._create_print_job_response(message.request_id, job_id, message.version_number)
             
         except Exception as e:
-            logger.error(f"❌ Error in print job handler: {e}")
+            logger.error(f"❌ Error en manejador de trabajo de impresión: {e}")
             import traceback
-            logger.debug(f"Print job handler error: {traceback.format_exc()}")
+            logger.debug(f"Error del manejador de Print Job: {traceback.format_exc()}")
             return self._create_error_response(message.request_id, 0x0500, message.version_number)  # server-error-internal-error
     
+    # Crea registro de trabajo con ID único y estado inicial
     def _create_job(self, message: IPPMessage) -> int:
 
         job_id = self.job_counter
@@ -1121,21 +1063,19 @@ class IPPServer:
         }
         
         self.active_jobs[job_id] = job
-        logger.info(f"Created job {job_id}")
+        logger.info(f"Trabajo {job_id} creado")
         
         return job_id
     
+    # Programa la eliminación diferida de un trabajo de la cola activa
     async def _schedule_job_removal(self, job_id: int):
-        """
-        Remueve un job de active_jobs después del período de retención.
-        Esto permite que CUPS pueda consultar el estado del job antes de que desaparezca.
-        """
+
         try:
             await asyncio.sleep(self.job_retention_seconds)
             
             if job_id in self.active_jobs:
                 job = self.active_jobs.pop(job_id)
-                logger.info(f"🗑️  Job {job_id} removed from active queue (state: {job['state']})")
+                logger.info(f"🗑️  Trabajo {job_id} removido de la cola activa (estado: {job['state']})")
                 
         except asyncio.CancelledError:
             logger.debug(f"Job {job_id} removal task cancelled")
@@ -1314,12 +1254,7 @@ class IPPServer:
         return response.getvalue()
 
     def _get_requested_attributes(self, message: IPPMessage) -> list:
-        """
-        Versión mejorada que maneja correctamente atributos vacíos y multi-valor.
-        
-        PROBLEMA ORIGINAL: No manejaba correctamente cuando requested-attributes
-        está vacío o tiene valores None/vacíos.
-        """
+
         if 'requested-attributes' not in message.operation_attributes:
             return []  # Vacío => enviar todo
 
@@ -1363,12 +1298,7 @@ class IPPServer:
         return cleaned
     
     def _get_marker_attributes(self) -> dict:
-        """
-        Retorna atributos de marcadores (tinta/papel) para CUPS.
-        
-        Para impresoras sin indicadores de nivel, enviamos valores genéricos
-        que indican "no aplicable" o "desconocido".
-        """
+
         return {
             # marker-colors: Lista de colores (vacío para monocromático)
             'marker-colors': ['#000000'],  # Negro para impresoras monocromáticas
@@ -1393,12 +1323,7 @@ class IPPServer:
         }
     
     def _get_printer_state_info(self) -> Dict[str, Any]:
-        """
-        Calcula el estado actual de la impresora de forma consistente.
-        
-        Returns:
-            dict con keys: state, state_reasons, state_message, is_accepting_jobs
-        """
+
         # Determinar estado base (3=idle, 4=processing, 5=stopped)
         if self.printer_backend and hasattr(self.printer_backend, 'is_ready'):
             is_ready = self.printer_backend.is_ready()
@@ -1445,11 +1370,7 @@ class IPPServer:
         }
     
     def get_connection_statistics(self) -> Dict[str, Any]:
-        """
-        AGREGAR este método nuevo para debugging
-        
-        Retorna estadísticas de conexiones para diagnosticar problemas.
-        """
+
         return {
             'total_connections': self.connection_stats['total_connections'],
             'valid_connections': self.connection_stats['valid_connections'],
