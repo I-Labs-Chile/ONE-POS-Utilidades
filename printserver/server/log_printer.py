@@ -6,31 +6,36 @@ import io
 
 logger = logging.getLogger(__name__)
 
+# Impresor de logs en formato ESC/POS para tickets
 class LogPrinter:
     
     def __init__(self, printer_backend=None):
         self.printer_backend = printer_backend
         self.enabled = False
         self.log_levels = ['INFO', 'WARNING', 'ERROR']
-        self.max_line_length = 32  # Para impresoras de 58mm
+        self.max_line_length = 32  # Impresoras de 58mm
         
-        # ESC/POS commands
+        # Comandos ESC/POS
         self.ESC = b'\x1b'
         self.GS = b'\x1d'
         
+    # Asigna el backend de impresión a utilizar
     def set_printer_backend(self, printer_backend):
         self.printer_backend = printer_backend
         
+    # Habilita la impresión de logs; niveles posibles: ['INFO','WARNING','ERROR']
     def enable(self, log_levels: Optional[List[str]] = None):
         self.enabled = True
         if log_levels:
             self.log_levels = log_levels
-        logger.info(f"Log printing enabled for levels: {self.log_levels}")
+        logger.info(f"Impresión de logs habilitada para niveles: {self.log_levels}")
         
+    # Deshabilita la impresión de logs
     def disable(self):
         self.enabled = False
-        logger.info("Log printing disabled")
+        logger.info("Impresión de logs deshabilitada")
         
+    # Imprime un log con nivel y mensaje; módulo opcional para identificar origen
     async def print_log(self, level: str, message: str, module: str = ""):
 
         if not self.enabled or not self.printer_backend:
@@ -40,53 +45,55 @@ class LogPrinter:
             return
             
         try:
-            # Create formatted log entry
+            # Crear entrada formateada
             escpos_data = self._create_log_entry(level, message, module)
             
-            # Send to printer
+            # Enviar a impresora
             await self.printer_backend.send_raw(escpos_data)
             
         except Exception as e:
-            # Don't log this error to avoid recursion
-            print(f"Failed to print log to printer: {e}")
+            # Evitar recursión de logs
+            print(f"Fallo al imprimir log en impresora: {e}")
     
+    # Genera bytes ESC/POS con encabezado y mensaje envueltos a ancho de papel
     def _create_log_entry(self, level: str, message: str, module: str = "") -> bytes:
 
         output = io.BytesIO()
         
-        # Initialize printer
+        # Inicializar impresora
         output.write(self.ESC + b'@')
         
-        # Set character set to PC850 (Spanish characters)
+        # Conjunto de caracteres PC850 (soporta español)
         output.write(self.ESC + b't' + b'\x13')
         
-        # Header with timestamp and level
+        # Encabezado con hora y nivel
         timestamp = datetime.now().strftime("%H:%M:%S")
         header = f"[{timestamp}] {level}"
         
         if module:
-            header += f" {module[:8]}"  # Truncate module name
+            header += f" {module[:8]}"  # Truncar nombre de módulo
             
-        # Print header in bold
-        output.write(self.ESC + b'E\x01')  # Bold on
+        # Imprimir encabezado en negrita
+        output.write(self.ESC + b'E\x01')  # Negrita ON
         output.write(self._wrap_text(header).encode('cp850', errors='replace'))
-        output.write(self.ESC + b'E\x00')  # Bold off
+        output.write(self.ESC + b'E\x00')  # Negrita OFF
         output.write(b'\n')
         
-        # Print message
+        # Imprimir mensaje
         wrapped_message = self._wrap_text(message)
         output.write(wrapped_message.encode('cp850', errors='replace'))
         output.write(b'\n')
         
-        # Add separator for important messages
+        # Separador para mensajes importantes
         if level in ['WARNING', 'ERROR']:
             output.write(b'-' * self.max_line_length + b'\n')
         
-        # Feed extra line
+        # Alimentación extra
         output.write(b'\n')
         
         return output.getvalue()
     
+    # Envuelve texto al ancho máximo de línea conservando palabras
     def _wrap_text(self, text: str) -> str:
 
         if len(text) <= self.max_line_length:
@@ -109,6 +116,7 @@ class LogPrinter:
             
         return '\n'.join(lines)
     
+    # Imprime un banner de inicio con información del servidor (host, puerto, versión)
     async def print_startup_banner(self, server_info: dict):
 
         if not self.enabled or not self.printer_backend:
@@ -117,37 +125,38 @@ class LogPrinter:
         try:
             output = io.BytesIO()
             
-            # Initialize printer
+            # Inicializar
             output.write(self.ESC + b'@')
             
-            # Center align
+            # Centrar
             output.write(self.ESC + b'a\x01')
             
-            # Print banner in enlarged text
-            output.write(self.GS + b'!\x11')  # Double height and width
+            # Texto grande
+            output.write(self.GS + b'!\x11')  # Doble alto y ancho
             output.write(b'ONE-POS\n')
-            output.write(self.GS + b'!\x00')  # Normal size
+            output.write(self.GS + b'!\x00')  # Tamaño normal
             
             output.write(b'Print Server\n')
             output.write(f"v{server_info.get('version', '1.0')}\n".encode())
             
-            # Left align for details
+            # Alinear a la izquierda
             output.write(self.ESC + b'a\x00')
             output.write(b'\n')
             
-            # Server details
+            # Detalles
             output.write(f"Host: {server_info.get('host', 'localhost')}\n".encode())
-            output.write(f"Port: {server_info.get('port', 631)}\n".encode())
-            output.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n".encode())
+            output.write(f"Puerto: {server_info.get('port', 631)}\n".encode())
+            output.write(f"Inicio: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n".encode())
             
-            # Add separator
+            # Separador
             output.write(b'=' * self.max_line_length + b'\n\n')
             
             await self.printer_backend.send_raw(output.getvalue())
             
         except Exception as e:
-            print(f"Failed to print startup banner: {e}")
+            print(f"Fallo al imprimir banner de inicio: {e}")
     
+    # Imprime un reporte de estado con métricas básicas (impresora y trabajos)
     async def print_status_report(self, status_info: dict):
 
         if not self.enabled or not self.printer_backend:
@@ -156,42 +165,42 @@ class LogPrinter:
         try:
             output = io.BytesIO()
             
-            # Initialize printer
+            # Inicializar
             output.write(self.ESC + b'@')
             
-            # Title
-            output.write(self.ESC + b'E\x01')  # Bold
-            output.write(b'STATUS REPORT\n')
+            # Título
+            output.write(self.ESC + b'E\x01')  # Negrita
+            output.write(b'REPORTE DE ESTADO\n')
             output.write(self.ESC + b'E\x00')  # Normal
             
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            output.write(f"Time: {timestamp}\n".encode())
+            output.write(f"Hora: {timestamp}\n".encode())
             output.write(b'-' * self.max_line_length + b'\n')
             
-            # Printer status
+            # Estado de impresora
             if 'printer' in status_info:
                 printer = status_info['printer']
-                output.write(b'PRINTER:\n')
-                output.write(f"Connected: {printer.get('connected', 'Unknown')}\n".encode())
+                output.write(b'IMPRESORA:\n')
+                output.write(f"Conectada: {printer.get('connected', 'Desconocido')}\n".encode())
                 if printer.get('device_info'):
-                    output.write(f"Device: {printer['device_info']}\n".encode())
+                    output.write(f"Dispositivo: {printer['device_info']}\n".encode())
             
-            # Job statistics
+            # Estadísticas de trabajos
             if 'jobs' in status_info:
                 jobs = status_info['jobs']
-                output.write(b'\nJOBS:\n')
-                output.write(f"Active: {jobs.get('active', 0)}\n".encode())
-                output.write(f"Completed: {jobs.get('completed', 0)}\n".encode())
-                output.write(f"Failed: {jobs.get('failed', 0)}\n".encode())
+                output.write(b'\nTRABAJOS:\n')
+                output.write(f"Activos: {jobs.get('active', 0)}\n".encode())
+                output.write(f"Completados: {jobs.get('completed', 0)}\n".encode())
+                output.write(f"Fallidos: {jobs.get('failed', 0)}\n".encode())
             
             output.write(b'\n' + b'=' * self.max_line_length + b'\n\n')
             
             await self.printer_backend.send_raw(output.getvalue())
             
         except Exception as e:
-            print(f"Failed to print status report: {e}")
+            print(f"Fallo al imprimir reporte de estado: {e}")
 
-# Custom logging handler for printing logs to printer
+# Handler de logging que envía registros a la impresora
 class PrinterLogHandler(logging.Handler):
     
     def __init__(self, log_printer: LogPrinter):
@@ -199,16 +208,17 @@ class PrinterLogHandler(logging.Handler):
         self.log_printer = log_printer
         self.loop = None
         
+    # Emite un registro de logging hacia la impresora si está habilitado
     def emit(self, record):
         if self.log_printer and self.log_printer.enabled:
             try:
-                # Get or create event loop
+                # Obtener o verificar loop de eventos activo
                 try:
                     loop = asyncio.get_running_loop()
                 except RuntimeError:
-                    return  # No event loop, skip
+                    return  # Sin loop, se omite
                 
-                # Schedule the print task
+                # Programar tarea de impresión
                 asyncio.create_task(
                     self.log_printer.print_log(
                         record.levelname,
@@ -217,4 +227,4 @@ class PrinterLogHandler(logging.Handler):
                     )
                 )
             except Exception:
-                pass  # Silently ignore errors to avoid recursion
+                pass  # Silenciar para evitar recursión
