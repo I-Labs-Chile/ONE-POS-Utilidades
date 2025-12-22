@@ -1,32 +1,23 @@
-# Ignorar carpetas y archivos innecesarios
-__pycache__/
-*.py[cod]
-*.pyo
-
-# Entornos virtuales
+# Entorno Python
 .venv/
 venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
-# Archivos de caché de pytest
-.pytest_cache/
+# Build y binarios
+build/
+dist/
+*.spec
 
-# Archivos de configuración de IDE
-.vscode/
-.idea/
-
-# Archivos temporales del sistema
-.DS_Store
-Thumbs.db
-
-# Logs y debug
-debug_logs/
+# Datos de ejecución
+/data/
 *.json
-*.bin
-*.escpos
+
+# Logs
 *.log
 
-# Test files
-test_*.png
-test_*.jpg
-test_*.pdf
-test_qr.*
+# IDE/Editor
+.vscode/
+.idea/

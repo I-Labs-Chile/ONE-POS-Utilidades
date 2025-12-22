@@ -1,0 +1,7 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.0
+pydantic==2.6.4
+python-multipart==0.0.9
+Pillow==10.3.0
+pyusb==1.2.1
+requests==2.32.3
