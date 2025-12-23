@@ -242,11 +242,11 @@ class EscposSender:
             return
         self._send(b"\n" * lines)
 
-    def text(self, content: str, encoding: str = "utf-8"):
+    def text(self, content: str, encoding: str = "cp437"):
         # Imprime una línea de texto simple
+        # Codificación por defecto: cp437 (DOS/OEM) común en impresoras ESC/POS
         if not content:
             return
-        self.init()
         self._send(content.encode(encoding, errors="replace") + b"\n")
 
     def print_qr(self, data: str, size: int = 4, ec_level: int = 48):
@@ -256,7 +256,6 @@ class EscposSender:
         # ec_level: nivel de corrección (48=L,49=M,50=Q,51=H)
         if not data:
             return
-        self.init()
         payload = data.encode("utf-8", errors="replace")
         if size < 1:
             size = 1
@@ -264,17 +263,25 @@ class EscposSender:
             size = 16
         if ec_level not in (48, 49, 50, 51):
             ec_level = 48
+        
+        # Seleccionar modelo QR 2 (más compatible)
+        self._send(b"\x1D(k" + bytes([4, 0, 49, 65, 50, 0]))
+        
         # Tamaño de módulo
         self._send(b"\x1D(k" + bytes([3, 0, 49, 67, size]))
+        
         # Nivel de corrección de errores
         self._send(b"\x1D(k" + bytes([3, 0, 49, 69, ec_level]))
+        
         # Almacenar datos del QR
         length = len(payload) + 3
         pL = length & 0xFF
         pH = (length >> 8) & 0xFF
         self._send(b"\x1D(k" + bytes([pL, pH, 49, 80, 48]) + payload)
+        
         # Imprimir QR
         self._send(b"\x1D(k" + bytes([3, 0, 49, 81, 48]))
+        
         self.feed(2)
 
     def print_image(self, img: Image.Image):

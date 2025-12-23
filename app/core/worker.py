@@ -35,12 +35,22 @@ class PrintWorker:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         print("# Worker de impresión iniciado")
+        # Ejecutar prueba de impresión automática al iniciar
+        self._print_welcome()
 
     def stop(self):
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=5)
         print("# Worker de impresión detenido")
+
+    def _print_welcome(self):
+        # Imprime mensaje de bienvenida y QR al iniciar el servidor
+        from app.core.test_print import run_printer_selftest
+        try:
+            threading.Thread(target=lambda: run_printer_selftest(self), daemon=True).start()
+        except Exception as e:
+            print(f"# No se pudo ejecutar impresión de bienvenida: {e}")
 
     def _create_sender(self) -> Optional[EscposSender]:
         # Crear sender USB bajo demanda
