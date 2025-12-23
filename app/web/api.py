@@ -4,6 +4,7 @@
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Request
 from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import os
 import uuid
@@ -14,8 +15,17 @@ from app.core.worker import PrintWorker
 from app.core.test_print import run_printer_selftest
 from app.utils.network import get_primary_ip
 from app.web.frontend import render_upload_page
+from pathlib import Path
 
 app = FastAPI()
+
+# Montar archivos estáticos del frontend (CSS, JS, imágenes)
+_frontend_dir = Path(__file__).resolve().parent / "frontend"
+_frontend_static = _frontend_dir / "src"
+
+# Montar primero el directorio src para archivos CSS y JS
+if _frontend_static.exists():
+    app.mount("/static", StaticFiles(directory=str(_frontend_static)), name="static")
 
 # Inicializar cola y worker globales
 queue = PrintQueue()
@@ -82,6 +92,42 @@ async def imprimir_pdf(request: Request, archivo: UploadFile = File(...)):
         state=JobState.PENDING,
         pdf_path=tmp_path,
         error_message="",
+        kind="pdf",
+    )
+    queue.enqueue(job)
+    return JSONResponse({"id": job_id, "estado": job.state})
+
+
+@app.post("/imprimir-imagen")
+async def imprimir_imagen(request: Request, archivo: UploadFile = File(...)):
+    # Validar tipo de archivo de imagen por extensión
+    nombre = archivo.filename.lower()
+    extensiones_permitidas = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp")
+    if not nombre.endswith(extensiones_permitidas):
+        raise HTTPException(status_code=400, detail="Solo se aceptan imágenes (jpg, png, bmp, gif, webp)")
+    # Guardar temporalmente la imagen en la carpeta de trabajos
+    trabajos_dir = queue.get_jobs_dir()
+    os.makedirs(trabajos_dir, exist_ok=True)
+    job_id = str(uuid.uuid4())
+    # Mantener la extensión original para facilitar diagnóstico en disco
+    _, ext = os.path.splitext(nombre)
+    if not ext:
+        ext = ".png"
+    tmp_path = os.path.join(trabajos_dir, f"{job_id}{ext}")
+    contenido = await archivo.read()
+    with open(tmp_path, "wb") as f:
+        f.write(contenido)
+    # Crear trabajo y agregar a la cola como imagen
+    cliente_ip = request.client.host if request and request.client else "desconocido"
+    job = PrintJob(
+        id=job_id,
+        client_ip=cliente_ip,
+        original_filename=archivo.filename,
+        received_at=int(time.time()),
+        state=JobState.PENDING,
+        pdf_path=tmp_path,
+        error_message="",
+        kind="image",
     )
     queue.enqueue(job)
     return JSONResponse({"id": job_id, "estado": job.state})

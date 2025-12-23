@@ -6,6 +6,14 @@
 import os
 import sys
 
+try:
+    # Cargar variables desde archivo .env si existe (útil para despliegues y PyInstaller)
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    # Si python-dotenv no está disponible se ignora silenciosamente
+    pass
+
 if __name__ == "__main__":
     # Configurar variables por defecto
     host = os.environ.get("SERVER_HOST", "0.0.0.0")

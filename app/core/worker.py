@@ -18,12 +18,15 @@ class PrintWorker:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         # Configuración de impresora
-        self.printer_interface = "usb"  # Solo USB
+        self.printer_interface = os.environ.get("PRINTER_IF", "usb").lower()
         self.printer_host = os.environ.get("PRINTER_HOST", "127.0.0.1")
         self.printer_port = int(os.environ.get("PRINTER_PORT", "9100"))
         self.usb_vendor = int(os.environ.get("USB_VENDOR", "0"))
         self.usb_product = int(os.environ.get("USB_PRODUCT", "0"))
+        # Ancho en píxeles pensado para 58mm por defecto (384 puntos)
         self.paper_width_px = int(os.environ.get("PAPER_WIDTH_PX", "384"))
+        # DPI de rasterización del PDF; 203 es estándar en muchas térmicas de 58mm
+        self.raster_dpi = int(os.environ.get("RASTER_DPI", os.environ.get("PAPER_DPI", "203")))
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -62,14 +65,29 @@ class PrintWorker:
             sender = self._create_sender()
             try:
                 self.queue.mark_processing(job)
-                print(f"# Procesando trabajo {job.id} archivo={job.original_filename}")
+                print(f"# Procesando trabajo {job.id} tipo={getattr(job, 'kind', 'pdf')} archivo={job.original_filename}")
                 if sender is None:
                     raise RuntimeError("Impresora no disponible")
-                images = self._pdf_to_images(job.pdf_path)
+                images = []
+                temp_generated = []
+                # Seleccionar flujo según tipo de trabajo
+                kind = getattr(job, "kind", "pdf")
+                if kind == "pdf":
+                    images = self._pdf_to_images(job.pdf_path)
+                    temp_generated = list(images)
+                elif kind == "image":
+                    images = [job.pdf_path]
+                else:
+                    raise RuntimeError(f"Tipo de trabajo desconocido: {kind}")
                 for img_path in images:
                     img = Image.open(img_path)
                     img = to_thermal_mono_dither(img, target_width=self.paper_width_px)
                     sender.print_image(img)
+                # Avanzar algunas líneas para evitar que el corte quede muy cerca del contenido
+                try:
+                    sender.feed(4)
+                except Exception:
+                    pass
                 sender.cut()
                 self.queue.mark_printed(job)
                 print(f"# Trabajo {job.id} impreso")
@@ -84,7 +102,8 @@ class PrintWorker:
                 except Exception:
                     pass
                 try:
-                    for p in locals().get('images', []):
+                    # Solo se eliminan los archivos generados temporalmente al rasterizar PDFs
+                    for p in locals().get('temp_generated', []):
                         if p:
                             os.remove(p)
                 except Exception:
@@ -98,7 +117,7 @@ class PrintWorker:
             "pdftoppm",
             "-png",
             "-r",
-            "200",
+            str(self.raster_dpi),
             pdf_path,
             out_prefix,
         ]

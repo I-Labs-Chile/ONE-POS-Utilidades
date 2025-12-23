@@ -29,6 +29,8 @@ class PrintJob:
     state: JobState
     pdf_path: str
     error_message: str = ""
+    # Tipo de contenido asociado al trabajo: "pdf" o "image"
+    kind: str = "pdf"
 
 class PrintQueue:
     def __init__(self):
