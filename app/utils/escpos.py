@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -
-# Envío de comandos ESC/POS por TCP o USB con detección y robustez
+ # Envío de comandos ESC/POS por TCP o USB con detección y robustez
 
 import socket
 from typing import Optional
 from PIL import Image
+from app.utils.usb_printer import USBPrinterBackend
 
 # Intentar importar PyUSB
 try:
@@ -172,6 +173,7 @@ class EscposSender:
         self.sock: Optional[socket.socket] = None
         self._usb_backend_file: Optional[_UsbFileBackend] = None
         self._usb_backend_lib: Optional[_UsbLibBackend] = None
+        self._usb_backend_printer: Optional[USBPrinterBackend] = None
         self._init_device()
 
     def _init_device(self):
@@ -184,23 +186,31 @@ class EscposSender:
             except Exception as e:
                 raise RuntimeError(f"No se pudo conectar a la impresora TCP: {e}")
         elif self.interface == "usb":
-            # Intentar primero PyUSB si está disponible, luego archivo de dispositivo
-            if HAS_PYUSB:
-                self._usb_backend_lib = _UsbLibBackend(timeout=5000, vendor_id=self.usb_vendor or None, product_id=self.usb_product or None)
-                if not self._usb_backend_lib.open():
-                    # Fallback a archivo
-                    self._usb_backend_lib = None
+            # Intentar primero backend especializado de impresoras USB basado en detección previa
+            try:
+                self._usb_backend_printer = USBPrinterBackend()
+                if not self._usb_backend_printer.connect():
+                    self._usb_backend_printer = None
+                    raise RuntimeError("No se pudo conectar a la impresora USB mediante auto detección")
+                print("# Conectado a impresora USB mediante auto detección de dispositivo")
+            except Exception as e:
+                # Si falla, se mantiene compatibilidad con PyUSB o archivo de dispositivo clásico
+                print(f"# Fallback a backends USB clásicos por error: {e}")
+                if HAS_PYUSB:
+                    self._usb_backend_lib = _UsbLibBackend(timeout=5000, vendor_id=self.usb_vendor or None, product_id=self.usb_product or None)
+                    if not self._usb_backend_lib.open():
+                        self._usb_backend_lib = None
+                        self._usb_backend_file = _UsbFileBackend()
+                        if not self._usb_backend_file.open():
+                            raise RuntimeError("No se pudo abrir la impresora USB ni por libusb ni por archivo de dispositivo")
+                        print("# Conectado a impresora USB por archivo de dispositivo")
+                    else:
+                        print("# Conectado a impresora USB por libusb")
+                else:
                     self._usb_backend_file = _UsbFileBackend()
                     if not self._usb_backend_file.open():
-                        raise RuntimeError("No se pudo abrir la impresora USB ni por libusb ni por archivo de dispositivo")
+                        raise RuntimeError("No se pudo abrir la impresora USB por archivo de dispositivo")
                     print("# Conectado a impresora USB por archivo de dispositivo")
-                else:
-                    print("# Conectado a impresora USB por libusb")
-            else:
-                self._usb_backend_file = _UsbFileBackend()
-                if not self._usb_backend_file.open():
-                    raise RuntimeError("No se pudo abrir la impresora USB por archivo de dispositivo")
-                print("# Conectado a impresora USB por archivo de dispositivo")
         else:
             raise RuntimeError("Interfaz de impresora desconocida")
 
@@ -208,7 +218,11 @@ class EscposSender:
         if self.interface == "tcp":
             self.sock.sendall(data)
         else:
-            if self._usb_backend_lib:
+            if self._usb_backend_printer:
+                ok = self._usb_backend_printer.send_raw(data)
+                if not ok:
+                    raise USBCommunicationError("No se pudieron enviar datos a la impresora USB")
+            elif self._usb_backend_lib:
                 self._usb_backend_lib.write(data)
             elif self._usb_backend_file:
                 self._usb_backend_file.write(data)
@@ -221,6 +235,47 @@ class EscposSender:
     def cut(self):
         # Corte parcial por defecto
         self._send(b"\x1DVA0")
+
+    def feed(self, lines: int = 1):
+        # Avance de papel una cantidad de líneas
+        if lines <= 0:
+            return
+        self._send(b"\n" * lines)
+
+    def text(self, content: str, encoding: str = "utf-8"):
+        # Imprime una línea de texto simple
+        if not content:
+            return
+        self.init()
+        self._send(content.encode(encoding, errors="replace") + b"\n")
+
+    def print_qr(self, data: str, size: int = 4, ec_level: int = 48):
+        # Imprime un código QR usando comandos ESC/POS compatibles con Epson
+        # data: texto/URL a codificar
+        # size: tamaño de módulo (1-16)
+        # ec_level: nivel de corrección (48=L,49=M,50=Q,51=H)
+        if not data:
+            return
+        self.init()
+        payload = data.encode("utf-8", errors="replace")
+        if size < 1:
+            size = 1
+        if size > 16:
+            size = 16
+        if ec_level not in (48, 49, 50, 51):
+            ec_level = 48
+        # Tamaño de módulo
+        self._send(b"\x1D(k" + bytes([3, 0, 49, 67, size]))
+        # Nivel de corrección de errores
+        self._send(b"\x1D(k" + bytes([3, 0, 49, 69, ec_level]))
+        # Almacenar datos del QR
+        length = len(payload) + 3
+        pL = length & 0xFF
+        pH = (length >> 8) & 0xFF
+        self._send(b"\x1D(k" + bytes([pL, pH, 49, 80, 48]) + payload)
+        # Imprimir QR
+        self._send(b"\x1D(k" + bytes([3, 0, 49, 81, 48]))
+        self.feed(2)
 
     def print_image(self, img: Image.Image):
         # Convertir imagen 1bpp en formato ESC/POS raster
@@ -256,11 +311,14 @@ class EscposSender:
                 except Exception:
                     pass
                 self.sock.close()
+            if self._usb_backend_printer:
+                self._usb_backend_printer.disconnect()
             if self._usb_backend_lib:
                 self._usb_backend_lib.close()
             if self._usb_backend_file:
                 self._usb_backend_file.close()
         finally:
             self.sock = None
+            self._usb_backend_printer = None
             self._usb_backend_lib = None
             self._usb_backend_file = None

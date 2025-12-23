@@ -3,7 +3,7 @@
 # Endpoints para subir PDF, consultar cola y salud
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 import os
 import uuid
@@ -11,7 +11,9 @@ import time
 
 from app.core.queue import PrintQueue, PrintJob, JobState
 from app.core.worker import PrintWorker
+from app.core.test_print import run_printer_selftest
 from app.utils.network import get_primary_ip
+from app.web.frontend import render_upload_page
 
 app = FastAPI()
 
@@ -25,6 +27,27 @@ class Health(BaseModel):
     ultimos_impresos: int
     ip_local: str
     impresora: dict
+
+
+class PrinterSelfTestResult(BaseModel):
+    ok: bool
+    url: str
+    detalle: str
+
+
+@app.get("/", response_class=HTMLResponse)
+async def raiz():
+    # Endpoint raíz que entrega la interfaz web para subir documentos
+    # Se delega la generación de HTML al módulo app.web.frontend
+    return render_upload_page()
+
+
+@app.post("/test-impresora", response_model=PrinterSelfTestResult)
+async def test_impresora():
+    # Endpoint para ejecutar una prueba de conexión con la impresora
+    # Envía un mensaje de bienvenida y un código QR con la URL del servidor
+    resultado = run_printer_selftest(worker)
+    return PrinterSelfTestResult(**resultado)
 
 @app.on_event("startup")
 async def on_startup():
