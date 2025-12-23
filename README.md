@@ -1,8 +1,282 @@
-# ONE-POS Utilidades · Servidor de impresión ESC/POS ligero
+# 🖨️ Servidor de Impresión ESC/POS para Impresora Térmica Q-Cube
 
-Un servicio de impresión minimalista y robusto para retail, pensado para correr en Raspberry Pi Zero y PCs Linux. No usa CUPS/IPP ni drivers del sistema: envía bytes ESC/POS directamente por USB o TCP.
+Sistema de impresión sencillo y confiable para impresoras térmicas. Permite imprimir documentos PDF e imágenes desde cualquier navegador web, sin necesidad de instalar drivers complicados.
 
-## Características Principales
+---
+
+## 📥 Descarga
+
+Descarga el archivo desde Google Drive:
+
+**📦 [Descargar Servidor de Impresión](ENLACE-AL-DRIVE)**
+
+> Archivo: `escpos-server-linux-x64-v1.0.0.tar.gz`
+
+---
+
+## 🚀 Instalación Rápida
+
+### Paso 1: Preparar el Sistema
+
+Abre una terminal y ejecuta estos comandos:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y poppler-utils libusb-1.0-0
+```
+
+> **¿Qué hace esto?** Instala las herramientas necesarias para que el servidor pueda procesar archivos PDF.
+
+### Paso 2: Descargar y Extraer
+
+1. Ve a la carpeta donde descargaste el archivo (normalmente `Descargas`)
+2. **Click derecho** en `escpos-server-linux-x64-v1.0.0.tar.gz`
+3. Selecciona **"Extraer aquí"** o **"Extraer en..."**
+
+O desde la terminal:
+
+```bash
+cd ~/Descargas
+tar -xzf escpos-server-linux-x64-v1.0.0.tar.gz
+cd escpos-server-linux-x64-v1.0.0
+```
+
+### Paso 3: Dar Permisos de Impresora
+
+Para que el servidor pueda usar la impresora USB, ejecuta:
+
+```bash
+sudo usermod -a -G lp $USER
+```
+
+**Importante:** Después de este comando, debes **cerrar sesión y volver a entrar** para que los cambios surtan efecto.
+
+---
+
+## 🎯 Cómo Usar
+
+### Iniciar el Servidor
+
+Hay dos formas de iniciar el servidor:
+
+#### Opción 1: Doble Click (RECOMENDADO)
+
+1. Abre la carpeta `escpos-server-linux-x64-v1.0.0`
+2. **Doble click** en el archivo `escpos-server.desktop`
+3. Si te pregunta, selecciona **"Confiar y ejecutar"** o **"Marcar como ejecutable"**
+
+Se abrirá una terminal mostrando los logs del servidor en tiempo real.
+
+#### Opción 2: Desde Terminal
+
+```bash
+cd ~/Descargas/escpos-server-linux-x64-v1.0.0
+./launch-server.sh
+```
+
+### ✅ Verificar que Funciona
+
+Cuando el servidor inicie correctamente, verás algo como esto:
+
+```
+╔═══════════════════════════════════════════════╗
+║  Servidor de Impresión ESC/POS - Q-Cube      ║
+║  Logs en tiempo real                          ║
+╚═══════════════════════════════════════════════╝
+
+============================================================
+    SERVIDOR DE IMPRESIÓN ESC/POS - Q-CUBE
+============================================================
+  Host: 0.0.0.0
+  Puerto: 8080
+  Acceso local: http://localhost:8080
+  Presiona Ctrl+C para detener el servidor
+============================================================
+
+INFO:     Started server process
+INFO:     Application startup complete.
+```
+
+### 🌐 Abrir la Interfaz Web
+
+1. Abre tu navegador web (Chrome, Firefox, etc.)
+2. Escribe en la barra de dirección: `http://localhost:8080`
+3. Verás la interfaz de impresión
+
+### 🖨️ Imprimir un Documento
+
+1. En la interfaz web, **arrastra un archivo PDF o imagen** al cuadro de impresión
+2. O haz **click en el cuadro** para seleccionar un archivo
+3. El documento se enviará automáticamente a la impresora
+
+### 🛑 Detener el Servidor
+
+Simplemente **cierra la ventana de la terminal** que se abrió, o presiona `Ctrl+C` en la terminal.
+
+---
+
+## 📱 Imprimir desde Otros Dispositivos
+
+### Desde un Celular o Tablet
+
+1. Asegúrate de que el celular/tablet esté **conectado a la misma red WiFi** que el computador
+2. En el celular, abre el navegador (Chrome, Safari, etc.)
+3. Averigua la IP del computador donde corre el servidor:
+   - En la terminal del servidor, busca una línea que dice algo como:
+   ```
+   Impresora conectada: /dev/usb/lp0
+   ```
+   - O ejecuta en otra terminal: `ip addr show | grep inet`
+4. En el celular, ve a: `http://IP-DEL-COMPUTADOR:8080`
+   - Por ejemplo: `http://192.168.1.100:8080`
+5. ¡Ya puedes arrastrar archivos desde tu celular!
+
+### Desde Otra Computadora
+
+1. Conecta la otra computadora a la **misma red**
+2. Abre el navegador
+3. Ve a: `http://IP-DEL-SERVIDOR:8080`
+
+---
+
+## ⚙️ Configuración Avanzada (Opcional)
+
+### Cambiar el Puerto del Servidor
+
+Si el puerto 8080 está ocupado o quieres usar otro:
+
+1. En la carpeta del servidor, copia el archivo de ejemplo:
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Edita el archivo `.env`:
+   ```bash
+   nano .env
+   ```
+
+3. Cambia la línea:
+   ```
+   SERVER_PORT=8080
+   ```
+   Por el puerto que quieras, por ejemplo:
+   ```
+   SERVER_PORT=3000
+   ```
+
+4. Guarda y reinicia el servidor
+
+### Usar Impresora de Red (TCP/IP)
+
+Si tu impresora se conecta por red en lugar de USB:
+
+1. Edita el archivo `.env`:
+   ```bash
+   nano .env
+   ```
+
+2. Cambia estas líneas:
+   ```
+   PRINTER_IF=tcp
+   PRINTER_HOST=192.168.1.100  # IP de tu impresora
+   PRINTER_PORT=9100            # Puerto de la impresora
+   ```
+
+3. Guarda y reinicia el servidor
+
+### Papel de 80mm en lugar de 58mm
+
+1. Edita el archivo `.env`:
+   ```bash
+   nano .env
+   ```
+
+2. Cambia:
+   ```
+   PAPER_WIDTH_PX=576  # Para papel de 80mm
+   ```
+
+3. Guarda y reinicia el servidor
+
+---
+
+## 🆘 Solución de Problemas
+
+### ❌ "No se encuentra la impresora"
+
+**Solución:**
+1. Verifica que la impresora esté conectada y encendida
+2. Ejecuta: `lsusb` para ver si aparece la impresora
+3. Asegúrate de haber reiniciado sesión después de agregar tu usuario al grupo `lp`
+4. Si aún no funciona, ejecuta el servidor con `sudo`:
+   ```bash
+   sudo ./launch-server.sh
+   ```
+
+### ❌ "Permission denied en /dev/usb/lp0"
+
+**Solución:**
+```bash
+# Agregar tu usuario al grupo lp
+sudo usermod -a -G lp $USER
+
+# Cerrar sesión completamente y volver a entrar
+# O ejecutar con sudo
+sudo ./launch-server.sh
+```
+
+### ❌ "Puerto 8080 en uso"
+
+**Solución 1 - Cambiar el puerto:**
+1. Edita `.env` y cambia `SERVER_PORT=8080` por otro puerto (ej: `SERVER_PORT=3000`)
+2. Reinicia el servidor
+
+**Solución 2 - Cerrar el programa que usa el puerto:**
+```bash
+# Ver qué programa usa el puerto 8080
+sudo lsof -ti:8080
+
+# Cerrar ese programa
+sudo kill $(sudo lsof -ti:8080)
+```
+
+### ❌ "No puedo acceder desde otro dispositivo"
+
+**Solución:**
+1. Verifica que ambos dispositivos estén en la misma red WiFi
+2. Desactiva el firewall temporalmente o permite el puerto 8080:
+   ```bash
+   sudo ufw allow 8080
+   ```
+3. Usa la IP correcta (no uses `localhost` desde otro dispositivo)
+
+### ❌ "Los documentos salen muy claros o muy oscuros"
+
+El servidor ajusta automáticamente el brillo y contraste, pero si aún no se ve bien:
+
+1. Revisa la configuración de densidad de tu impresora
+2. Limpia el cabezal de la impresora
+3. Verifica que estés usando papel térmico de buena calidad
+
+### ❌ "La impresión sale cortada"
+
+**Solución:**
+Cambia el ancho del papel según tu impresora:
+- Para papel de **58mm**: `PAPER_WIDTH_PX=384` (predeterminado)
+- Para papel de **80mm**: `PAPER_WIDTH_PX=576`
+
+---
+
+## 📞 Soporte
+
+Si tienes problemas o preguntas:
+
+- **GitHub Issues**: [https://github.com/I-Labs-Chile/ONE-POS-Utilidades/issues](https://github.com/I-Labs-Chile/ONE-POS-Utilidades/issues)
+- **Email**: soporte@i-labs.cl
+
+---
+
+## 📄 Información Técnica (Para Desarrolladores)
 
 ### 🖨️ Impresión Avanzada
 - **PDF → Raster → Monocromo**: Conversión automática con dithering de alta calidad

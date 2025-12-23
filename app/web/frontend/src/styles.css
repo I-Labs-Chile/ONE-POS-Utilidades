@@ -31,7 +31,7 @@ h1 {
     padding: 40px 20px;
     cursor: pointer;
     background: #fafafa;
-    transition: border-color 0.2s, background 0.2s;
+    transition: border-color 0.2s, background 0.2s, opacity 0.2s;
     min-height: 80px;
     display: flex;
     align-items: center;
@@ -41,6 +41,17 @@ h1 {
 .dropzone.drag {
     border-color: #0f766e;
     background: #ecfeff;
+}
+
+.dropzone.disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    background: #e5e7eb;
+    border-color: #9ca3af;
+}
+
+.dropzone.disabled p {
+    color: #9ca3af;
 }
 
 .dropzone p {

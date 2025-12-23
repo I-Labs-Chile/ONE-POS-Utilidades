@@ -4,6 +4,8 @@ const statusBox = document.getElementById("status");
 const healthDot = document.getElementById("healthDot");
 const healthText = document.getElementById("healthText");
 
+let printerAvailable = false;
+
 function showStatus(text, type) {
     statusBox.textContent = text;
     statusBox.className = "status " + type;
@@ -11,6 +13,11 @@ function showStatus(text, type) {
 }
 
 async function sendFile(file) {
+    if (!printerAvailable) {
+        showStatus("Impresora no disponible. Por favor, conecte la impresora.", "error");
+        return;
+    }
+
     showStatus("Enviando archivo a impresión…", "warn");
 
     const isPdf = file.name.toLowerCase().endsWith(".pdf");
@@ -73,21 +80,31 @@ async function checkHealth() {
         const resp = await fetch("/salud");
         const data = await resp.json();
 
-        if (data.ok && data.cola_pendientes === 0) {
-            healthDot.className = "dot ok";
-            healthText.textContent = "Impresora operativa";
-        } else if (data.ok && data.cola_pendientes > 0) {
-            healthDot.className = "dot warn";
-            healthText.textContent = `${data.cola_pendientes} trabajo(s) pendiente(s)`;
+        printerAvailable = data.impresora_disponible;
+
+        if (data.impresora_disponible) {
+            if (data.cola_pendientes === 0) {
+                healthDot.className = "dot ok";
+                healthText.textContent = `Impresora conectada: ${data.impresora_nombre || "Impresora operativa"}`;
+            } else {
+                healthDot.className = "dot warn";
+                healthText.textContent = `${data.cola_pendientes} trabajo(s) pendiente(s)`;
+            }
+            // Habilitar zona de drop
+            dropzone.classList.remove("disabled");
         } else {
             healthDot.className = "dot error";
-            healthText.textContent = "Error de impresora";
+            healthText.textContent = "Impresora no conectada";
+            // Deshabilitar zona de drop
+            dropzone.classList.add("disabled");
         }
     } catch {
+        printerAvailable = false;
         healthDot.className = "dot error";
         healthText.textContent = "Servidor no disponible";
+        dropzone.classList.add("disabled");
     }
 }
 
 checkHealth();
-setInterval(checkHealth, 5000);
+setInterval(checkHealth, 3000);

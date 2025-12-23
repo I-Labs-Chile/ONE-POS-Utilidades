@@ -6,14 +6,17 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, R
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from typing import Optional
 import os
 import uuid
 import time
+import threading
 
 from app.core.queue import PrintQueue, PrintJob, JobState
 from app.core.worker import PrintWorker
 from app.core.test_print import run_printer_selftest
 from app.utils.network import get_primary_ip
+from app.utils.usb_detector import USBPrinterDetector
 from app.web.frontend import render_upload_page
 from pathlib import Path
 
@@ -31,12 +34,48 @@ if _frontend_static.exists():
 queue = PrintQueue()
 worker = PrintWorker(queue)
 
+# Estado global de la impresora
+printer_status = {
+    "available": False,
+    "last_check": 0,
+    "device_path": None,
+    "printer_name": None
+}
+printer_status_lock = threading.Lock()
+
+def check_printer_availability():
+
+    global printer_status
+    detector = USBPrinterDetector()
+    
+    while True:
+        try:
+            printers = detector.scan_for_printers()
+            with printer_status_lock:
+                if printers:
+                    printer_status["available"] = True
+                    printer_status["device_path"] = printers[0].device_path
+                    printer_status["printer_name"] = printers[0].friendly_name
+                else:
+                    printer_status["available"] = False
+                    printer_status["device_path"] = None
+                    printer_status["printer_name"] = None
+                printer_status["last_check"] = int(time.time())
+        except Exception as e:
+            with printer_status_lock:
+                printer_status["available"] = False
+                printer_status["last_check"] = int(time.time())
+        
+        time.sleep(3)  # Verificar cada 3 segundos
+
 class Health(BaseModel):
     ok: bool
     cola_pendientes: int
     ultimos_impresos: int
     ip_local: str
     impresora: dict
+    impresora_disponible: bool
+    impresora_nombre: Optional[str] = None
 
 
 class PrinterSelfTestResult(BaseModel):
@@ -63,6 +102,9 @@ async def test_impresora():
 async def on_startup():
     # Arrancar worker de impresión
     worker.start()
+    # Iniciar hilo de monitoreo de impresora
+    monitor_thread = threading.Thread(target=check_printer_availability, daemon=True)
+    monitor_thread.start()
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -155,12 +197,25 @@ async def estado():
 
 @app.get("/salud")
 async def salud():
-    # Endpoint de salud simple
+    # Endpoint de salud que incluye verificación de disponibilidad de impresora
     pendientes = queue.count_pending()
     impresos = queue.count_last_printed()
-    return JSONResponse(Health(ok=True, cola_pendientes=pendientes, ultimos_impresos=impresos, ip_local=get_primary_ip(), impresora={
-        "interfaz": worker.printer_interface,
-        "usb_vendor": worker.usb_vendor,
-        "usb_product": worker.usb_product,
-        "paper_width_px": worker.paper_width_px,
-    }).dict())
+    
+    with printer_status_lock:
+        impresora_disponible = printer_status["available"]
+        impresora_nombre = printer_status["printer_name"]
+    
+    return JSONResponse(Health(
+        ok=impresora_disponible, 
+        cola_pendientes=pendientes, 
+        ultimos_impresos=impresos, 
+        ip_local=get_primary_ip(), 
+        impresora={
+            "interfaz": worker.printer_interface,
+            "usb_vendor": worker.usb_vendor,
+            "usb_product": worker.usb_product,
+            "paper_width_px": worker.paper_width_px,
+        },
+        impresora_disponible=impresora_disponible,
+        impresora_nombre=impresora_nombre
+    ).dict())
