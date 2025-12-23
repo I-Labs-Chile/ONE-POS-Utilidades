@@ -6,11 +6,11 @@ Sistema de impresión sencillo y confiable para impresoras térmicas. Permite im
 
 ## 📥 Descarga
 
-Descarga el archivo desde Google Drive:
+Descarga la última versión desde GitHub Releases:
 
-**📦 [Descargar Servidor de Impresión](ENLACE-AL-DRIVE)**
+**📦 [Descargar Servidor de Impresión v1.0.0](https://github.com/I-Labs-Chile/ONE-POS-Utilidades/releases/download/1.0.0/escpos-server-linux-x64-v1.0.0.tar.gz)**
 
-> Archivo: `escpos-server-linux-x64-v1.0.0.tar.gz`
+> Archivo: `escpos-server-linux-x64-v1.0.0.tar.gz` (~33 MB)
 
 ---
 
