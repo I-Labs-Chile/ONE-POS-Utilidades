@@ -14,75 +14,53 @@ Descarga el archivo desde Google Drive:
 
 ---
 
-## 🚀 Instalación Rápida
+## 🚀 Instalación y Primer Uso
 
-### Paso 1: Preparar el Sistema
+### Paso 1: Instalar Dependencias del Sistema
 
-Abre una terminal y ejecuta estos comandos:
+Abre una terminal y ejecuta:
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y poppler-utils libusb-1.0-0
 ```
 
-> **¿Qué hace esto?** Instala las herramientas necesarias para que el servidor pueda procesar archivos PDF.
+> **¿Qué hace esto?** Instala las herramientas necesarias para procesar archivos PDF e impresoras USB.
 
-### Paso 2: Descargar y Extraer
+### Paso 2: Extraer el Archivo
 
-1. Ve a la carpeta donde descargaste el archivo (normalmente `Descargas`)
+1. Ve a la carpeta donde descargaste el archivo (normalmente **Descargas**)
 2. **Click derecho** en `escpos-server-linux-x64-v1.0.0.tar.gz`
-3. Selecciona **"Extraer aquí"** o **"Extraer en..."**
+3. Selecciona **"Extraer aquí"**
+4. Se creará una carpeta llamada `escpos-server-linux-x64-v1.0.0`
 
-O desde la terminal:
-
-```bash
-cd ~/Descargas
-tar -xzf escpos-server-linux-x64-v1.0.0.tar.gz
-cd escpos-server-linux-x64-v1.0.0
-```
-
-### Paso 3: Dar Permisos de Impresora
-
-Para que el servidor pueda usar la impresora USB, ejecuta:
-
-```bash
-sudo usermod -a -G lp $USER
-```
-
-**Importante:** Después de este comando, debes **cerrar sesión y volver a entrar** para que los cambios surtan efecto.
-
----
-
-## 🎯 Cómo Usar
-
-### Iniciar el Servidor
-
-Hay dos formas de iniciar el servidor:
-
-#### Opción 1: Doble Click (RECOMENDADO)
+### Paso 3: Abrir Terminal en la Carpeta
 
 1. Abre la carpeta `escpos-server-linux-x64-v1.0.0`
-2. **Doble click** en el archivo `escpos-server.desktop`
-3. Si te pregunta, selecciona **"Confiar y ejecutar"** o **"Marcar como ejecutable"**
+2. **Click derecho** dentro de la carpeta (en un espacio vacío)
+3. Selecciona **"Abrir en terminal"** o **"Open in Terminal"**
 
-Se abrirá una terminal mostrando los logs del servidor en tiempo real.
+### Paso 4: Iniciar el Servidor
 
-#### Opción 2: Desde Terminal
+En la terminal que se abrió, ejecuta:
 
 ```bash
-cd ~/Descargas/escpos-server-linux-x64-v1.0.0
-./launch-server.sh
+sudo ./launch-server.sh
 ```
 
-### ✅ Verificar que Funciona
+> **Nota:** Se te pedirá tu contraseña de administrador (sudo).
 
-Cuando el servidor inicie correctamente, verás algo como esto:
+### ✅ ¿Cómo sé que está funcionando?
+
+Si todo salió bien, se abrirá una **nueva ventana de terminal** mostrando algo como esto:
 
 ```
 ╔═══════════════════════════════════════════════╗
 ║  Servidor de Impresión ESC/POS - Q-Cube      ║
 ║  Logs en tiempo real                          ║
 ╚═══════════════════════════════════════════════╝
+
+Iniciando servidor...
 
 ============================================================
     SERVIDOR DE IMPRESIÓN ESC/POS - Q-CUBE
@@ -93,25 +71,41 @@ Cuando el servidor inicie correctamente, verás algo como esto:
   Presiona Ctrl+C para detener el servidor
 ============================================================
 
-INFO:     Started server process
+INFO:     Started server process [12345]
+INFO:     Waiting for application startup.
 INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+# Worker de impresión iniciado
+Impresora conectada: /dev/usb/lp0
 ```
 
-### 🌐 Abrir la Interfaz Web
+> 🎉 **¡Listo!** El servidor está corriendo correctamente.
+
+---
+
+## 🌐 Usar la Interfaz Web
+
+### Desde el Mismo Computador
 
 1. Abre tu navegador web (Chrome, Firefox, etc.)
-2. Escribe en la barra de dirección: `http://localhost:8080`
+2. Ve a: **http://localhost:8080**
 3. Verás la interfaz de impresión
 
-### 🖨️ Imprimir un Documento
+### Imprimir un Documento
 
-1. En la interfaz web, **arrastra un archivo PDF o imagen** al cuadro de impresión
-2. O haz **click en el cuadro** para seleccionar un archivo
+1. **Arrastra** un archivo PDF o imagen al cuadro de impresión
+2. O haz **click** en el cuadro para seleccionar un archivo
 3. El documento se enviará automáticamente a la impresora
+
+**Formatos soportados:**
+- 📄 PDF
+- 🖼️ Imágenes: JPG, PNG, BMP, GIF, WEBP
 
 ### 🛑 Detener el Servidor
 
-Simplemente **cierra la ventana de la terminal** que se abrió, o presiona `Ctrl+C` en la terminal.
+Para detener el servidor:
+- **Cierra la ventana** de la terminal que se abrió
+- O presiona `Ctrl+C` en la terminal
 
 ---
 
