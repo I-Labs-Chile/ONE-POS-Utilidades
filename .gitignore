@@ -7,8 +7,9 @@ __pycache__/
 *.pyd
 
 # Build y binarios
-build/
-dist/
+build/build/
+build/dist/
+build/output/
 *.spec
 
 # Datos de ejecución
