@@ -9,7 +9,8 @@ from typing import Optional
 from PIL import Image
 
 from app.core.queue import PrintQueue, PrintJob, JobState
-from app.utils.escpos import EscposSender
+from app.printer.manager import create_sender
+
 from app.utils.image import to_thermal_mono_dither
 
 class PrintWorker:
@@ -52,10 +53,9 @@ class PrintWorker:
         except Exception as e:
             print(f"# No se pudo ejecutar impresión de bienvenida: {e}")
 
-    def _create_sender(self) -> Optional[EscposSender]:
-        # Crear sender USB bajo demanda
+    def _create_sender(self):
         try:
-            return EscposSender(
+            return create_sender(
                 interface=self.printer_interface,
                 host=self.printer_host,
                 port=self.printer_port,
@@ -63,7 +63,7 @@ class PrintWorker:
                 usb_product=self.usb_product,
             )
         except Exception as e:
-            print(f"# No se pudo inicializar la impresora USB: {e}")
+            print(f"# No se pudo inicializar el backend de impresora: {e}")
             return None
 
     def _run(self):

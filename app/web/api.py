@@ -11,12 +11,12 @@ import os
 import uuid
 import time
 import threading
+import platform
 
 from app.core.queue import PrintQueue, PrintJob, JobState
 from app.core.worker import PrintWorker
 from app.core.test_print import run_printer_selftest
 from app.utils.network import get_primary_ip
-from app.utils.usb_detector import USBPrinterDetector
 from app.web.frontend import render_upload_page
 from pathlib import Path
 
@@ -39,34 +39,72 @@ printer_status = {
     "available": False,
     "last_check": 0,
     "device_path": None,
-    "printer_name": None
+    "printer_name": None,
+    "error": None
 }
 printer_status_lock = threading.Lock()
 
 def check_printer_availability():
-
+    """Monitorea continuamente la disponibilidad de la impresora"""
     global printer_status
-    detector = USBPrinterDetector()
-    
+
     while True:
         try:
-            printers = detector.scan_for_printers()
-            with printer_status_lock:
-                if printers:
-                    printer_status["available"] = True
-                    printer_status["device_path"] = printers[0].device_path
-                    printer_status["printer_name"] = printers[0].friendly_name
-                else:
-                    printer_status["available"] = False
+            system = platform.system()
+            
+            if system == "Windows":
+                # Windows: verificar impresora usando win32print
+                printer_name = os.environ.get("PRINTER_NAME") or os.environ.get("WINDOWS_PRINTER_NAME") or "POS-58"
+                is_available = False
+                error_msg = None
+                
+                try:
+                    import win32print
+                    # Intentar abrir y cerrar la impresora
+                    h = win32print.OpenPrinter(printer_name)
+                    win32print.ClosePrinter(h)
+                    is_available = True
+                except Exception as e:
+                    error_msg = f"No se puede acceder a '{printer_name}': {str(e)}"
+                    print(f"# {error_msg}")
+                
+                with printer_status_lock:
+                    printer_status["available"] = is_available
                     printer_status["device_path"] = None
-                    printer_status["printer_name"] = None
-                printer_status["last_check"] = int(time.time())
+                    printer_status["printer_name"] = printer_name if is_available else None
+                    printer_status["error"] = error_msg
+                    printer_status["last_check"] = int(time.time())
+                    
+            else:
+                # Linux: usar detector USB existente
+                from app.utils.usb_detector import USBPrinterDetector
+                detector = USBPrinterDetector()
+                printers = detector.scan_for_printers()
+                
+                with printer_status_lock:
+                    if printers:
+                        printer_status["available"] = True
+                        printer_status["device_path"] = printers[0].device_path
+                        printer_status["printer_name"] = printers[0].friendly_name
+                        printer_status["error"] = None
+                    else:
+                        printer_status["available"] = False
+                        printer_status["device_path"] = None
+                        printer_status["printer_name"] = None
+                        printer_status["error"] = "No se detectaron impresoras USB"
+                    printer_status["last_check"] = int(time.time())
+                    
         except Exception as e:
+            error_msg = f"Error en monitoreo de impresora: {str(e)}"
+            print(f"# {error_msg}")
             with printer_status_lock:
                 printer_status["available"] = False
+                printer_status["error"] = error_msg
                 printer_status["last_check"] = int(time.time())
-        
-        time.sleep(3)  # Verificar cada 3 segundos
+
+        # Esperar 3 segundos antes de la siguiente comprobación
+        time.sleep(3)
+
 
 class Health(BaseModel):
     ok: bool
@@ -76,6 +114,7 @@ class Health(BaseModel):
     impresora: dict
     impresora_disponible: bool
     impresora_nombre: Optional[str] = None
+    error: Optional[str] = None
 
 
 class PrinterSelfTestResult(BaseModel):
@@ -105,6 +144,7 @@ async def on_startup():
     # Iniciar hilo de monitoreo de impresora
     monitor_thread = threading.Thread(target=check_printer_availability, daemon=True)
     monitor_thread.start()
+    print("# Monitor de impresora iniciado")
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -204,8 +244,9 @@ async def salud():
     with printer_status_lock:
         impresora_disponible = printer_status["available"]
         impresora_nombre = printer_status["printer_name"]
+        error = printer_status.get("error")
     
-    return JSONResponse(Health(
+    health_data = Health(
         ok=impresora_disponible, 
         cola_pendientes=pendientes, 
         ultimos_impresos=impresos, 
@@ -217,5 +258,8 @@ async def salud():
             "paper_width_px": worker.paper_width_px,
         },
         impresora_disponible=impresora_disponible,
-        impresora_nombre=impresora_nombre
-    ).dict())
+        impresora_nombre=impresora_nombre,
+        error=error
+    )
+    
+    return JSONResponse(health_data.dict())

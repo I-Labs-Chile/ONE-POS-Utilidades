@@ -19,12 +19,21 @@ if __name__ == "__main__":
     host = os.environ.get("SERVER_HOST", "0.0.0.0")
     port = int(os.environ.get("SERVER_PORT", "8080"))
     
+    # Determinar backend de impresión
+    import platform
+    forced_backend = os.environ.get("PRINTER_BACKEND", "").lower()
+    if forced_backend:
+        backend_info = f"FORZADO: {forced_backend.upper()}"
+    else:
+        backend_info = f"Auto: {platform.system()}"
+    
     # Banner informativo
     print("=" * 60)
     print("    SERVIDOR DE IMPRESIÓN ESC/POS - Q-CUBE")
     print("=" * 60)
     print(f"  Host: {host}")
     print(f"  Puerto: {port}")
+    print(f"  Backend de impresión: {backend_info}")
     print(f"  Acceso local: http://localhost:{port}")
     print(f"  Presiona Ctrl+C para detener el servidor")
     print("=" * 60)

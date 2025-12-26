@@ -48,6 +48,9 @@ if errorlevel 1 (
     "%PROJECT_DIR%\.venv\Scripts\pip.exe" install pyinstaller
 )
 
+REM Ensure pywin32 is present for win32print
+"%PROJECT_DIR%\.venv\Scripts\pip.exe" install pywin32
+
 REM Versión
 set "VERSION=1.0.0"
 set "APP_NAME=escpos-server-windows-x64-v%VERSION%"
@@ -83,8 +86,8 @@ echo         'app.utils',
 echo         'app.utils.escpos',
 echo         'app.utils.image',
 echo         'app.utils.network',
-echo         'app.utils.usb_printer',
-echo         'app.utils.usb_detector',
+echo         'app.printer.manager',
+echo         'app.printer.windows_spooler',
 echo         'uvicorn.logging',
 echo         'uvicorn.loops',
 echo         'uvicorn.loops.auto',
@@ -95,13 +98,18 @@ echo         'uvicorn.protocols.websockets',
 echo         'uvicorn.protocols.websockets.auto',
 echo         'uvicorn.lifespan',
 echo         'uvicorn.lifespan.on',
-echo         'usb.backend',
-echo         'usb.backend.libusb1',
+echo         'win32print',
 echo     ],
 echo     hookspath=[],
 echo     hooksconfig={},
 echo     runtime_hooks=[],
-echo     excludes=[],
+echo     excludes=[
+echo         'usb',
+echo         'usb.backend',
+echo         'usb.backend.libusb1',
+echo         'app.utils.usb_printer',
+echo         'app.utils.usb_detector',
+echo     ],
 echo     win_no_prefer_redirects=False,
 echo     win_private_assemblies=False,
 echo     cipher=block_cipher,

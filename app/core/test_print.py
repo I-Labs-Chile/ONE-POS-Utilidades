@@ -7,7 +7,7 @@ import time
 from typing import Dict
 
 from app.core.worker import PrintWorker
-from app.utils.escpos import EscposSender
+from app.printer.manager import create_sender
 from app.utils.network import get_primary_ip
 
 
@@ -33,13 +33,18 @@ def run_printer_selftest(worker: PrintWorker) -> Dict[str, object]:
     resultado["url"] = url
     try:
         print("# Iniciando prueba de impresora")
-        sender = EscposSender(
+        # CAMBIO: Usar create_sender en lugar de instanciar EscposSender directamente
+        # Esto respeta el switch de plataforma Windows/Linux
+        sender = create_sender(
             interface=worker.printer_interface,
             host=worker.printer_host,
             port=worker.printer_port,
             usb_vendor=worker.usb_vendor,
             usb_product=worker.usb_product,
         )
+        if sender is None:
+            raise RuntimeError("No se pudo crear el backend de impresora")
+            
         print("# Impresora conectada correctamente para prueba de conexión")
         sender.init()
         sender.text("")
@@ -56,16 +61,23 @@ def run_printer_selftest(worker: PrintWorker) -> Dict[str, object]:
         sender.text("Escanea el codigo QR para")
         sender.text("acceder a la interfaz web:")
         sender.feed(2)
-        sender.print_qr(url, size=12)
+        # NOTA: print_qr puede no estar implementado en WindowsEscposSender
+        # Verificar si existe el método antes de llamarlo
+        if hasattr(sender, 'print_qr'):
+            sender.print_qr(url, size=12)
+        else:
+            sender.text(f"URL: {url}")
         sender.feed(2)
         sender.text(f"URL: {url}")
         sender.feed(3)
         sender.cut()
         sender.close()
         resultado["ok"] = True
-        resultado["detalle"] = "Prueba de impresión enviada correctamente"
-        print("# Prueba de impresión enviada correctamente")
+        resultado["detalle"] = "Prueba de impresión completada"
+        print("# Prueba de impresión completada exitosamente")
+        
     except Exception as e:
-        resultado["detalle"] = str(e)
         print(f"# Error en prueba de impresora: {e}")
+        resultado["detalle"] = str(e)
+        
     return resultado
