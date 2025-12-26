@@ -6,15 +6,51 @@ Sistema de impresión sencillo y confiable para impresoras térmicas. Permite im
 
 ## 📥 Descarga
 
-Descarga la última versión desde GitHub Releases:
+Descarga la última versión desde GitHub Releases según tu sistema:
 
-**📦 [Descargar Servidor de Impresión v1.0.0](https://github.com/I-Labs-Chile/ONE-POS-Utilidades/releases/download/1.0.0/escpos-server-linux-x64-v1.0.0.tar.gz)**
+- **🪟 Windows**: **[escpos-server-windows-x64-v1.0.0.zip](https://github.com/I-Labs-Chile/ONE-POS-Utilidades/releases/download/1.0.0/escpos-server-windows-x64-v1.0.0.zip)**
+  
+- **🐧 Linux**: **[escpos-server-linux-x64-v1.0.0.tar.gz](https://github.com/I-Labs-Chile/ONE-POS-Utilidades/releases/download/1.0.0/escpos-server-linux-x64-v1.0.0.tar.gz)**
 
-> Archivo: `escpos-server-linux-x64-v1.0.0.tar.gz` (~33 MB)
+> Windows: `escpos-server-windows-x64-v1.0.0.zip` | Linux: `escpos-server-linux-x64-v1.0.0.tar.gz`
 
 ---
 
-## 🚀 Instalación y Primer Uso
+## 🪟 Instalación en Windows
+
+### Paso 1: Instalar el Driver de la Impresora
+
+Descarga e instala el driver de la impresora POS para Windows:
+
+**[POS Printer Driver Setup V8.203.exe](https://github.com/CrisAlva1414/ONE-POS-Driver/raw/refs/heads/main/Driver/Windows%20Driver/POS%20Printer%20Driver%20Setup%20V8.203.exe)**
+
+> Asegúrate de que la impresora esté conectada por USB y encendida.
+
+### Paso 2: Descargar y Extraer el Servidor
+
+1. Descarga el archivo: **[escpos-server-windows-x64-v1.0.0.zip](https://github.com/I-Labs-Chile/ONE-POS-Utilidades/releases/download/1.0.0/escpos-server-windows-x64-v1.0.0.zip)**
+2. Haz clic derecho y selecciona **“Extraer todo…”**
+3. Abre la carpeta extraída `escpos-server-windows-x64-v1.0.0`
+
+### Paso 3: Ejecutar el Servidor
+
+1. Dentro de la carpeta, ejecuta **`escpos-server`**
+2. Si no abre, **haz clic derecho y “Ejecutar como administrador”**
+3. Mantén la impresora conectada y encendida, el software iniciará y quedará listo
+
+### Interfaz Web
+
+Una vez iniciado, abre tu navegador y ve a: **http://localhost:8080**.
+
+### Consejos (Windows)
+
+- Si Windows muestra advertencia de seguridad, permite la ejecución.
+- Si no puedes acceder desde otra máquina, permite el puerto 8080 en el firewall.
+- También puedes iniciar con PowerShell usando el script de la repo: [build/launch-server-windows.ps1](build/launch-server-windows.ps1).
+
+---
+
+## 🐧 Instalación en Linux
 
 ### Paso 1: Instalar Dependencias del Sistema
 
