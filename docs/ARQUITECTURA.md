@@ -76,7 +76,12 @@ Al arrancar ejecuta `selftest_fn` si fue inyectada (el servidor pasa `test_print
 - Datos separados por diseño: `run_cabina.py` fija defaults `SERVER_PORT=8081` y `QUEUE_DIR=./data-cabina` antes de importar módulos.
 
 ### `onepos_common/image.py`
-Pipeline térmico: resize al ancho del papel → grises → normalización de brillo (corrige <100 / >180) → auto-niveles con percentiles 2–98 → dithering Floyd–Steinberg → 1-bit.
+Dos pipelines de conversión a 1 bpp:
+
+- **Legacy** (`to_thermal_mono_dither`, documentos/PDF): resize LANCZOS → grises → normalización por umbrales (<100/>180) + contraste fijo → auto-niveles p2–p98 → Floyd–Steinberg.
+- **Foto** (`to_thermal_photo_dither`, preset `"foto"` de la cabina): resize LANCZOS → grises (601 o 709) → **auto-niveles primero** → exposición continua (`target/media` con clamp 0.80–1.35) → **gamma ~1.4** pegada al dithering (abre sombras y compensa el dot gain del papel) → Floyd–Steinberg. Constantes ajustables vía `THERMAL_GAMMA` y `THERMAL_BRIGHTNESS_TARGET`. El orden y variantes se estudian con `tools/comparar_pipeline.py`.
+
+El worker elige según `PrintJob.preset`: la cabina encola con `preset="foto"`; todo lo demás usa el legacy.
 
 > Rendimiento conocido: Floyd–Steinberg está implementado con bucles Python puros; en páginas grandes (PDF carta/A4 a 203 dpi ≈ 3,5 M píxeles) tarda varios segundos por página. Una vectorización fila-a-fila con NumPy sería la mejora natural.
 

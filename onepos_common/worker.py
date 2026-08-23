@@ -13,7 +13,7 @@ from PIL import Image
 from onepos_common.queue import PrintQueue, PrintJob, JobState
 from onepos_common.printer_manager import create_sender
 
-from onepos_common.image import to_thermal_mono_dither
+from onepos_common.image import to_thermal_mono_dither, to_thermal_photo_dither
 
 class PrintWorker:
     def __init__(self, queue: PrintQueue, selftest_fn=None):
@@ -99,7 +99,11 @@ class PrintWorker:
                     raise RuntimeError(f"Tipo de trabajo desconocido: {kind}")
                 for img_path in images:
                     img = Image.open(img_path)
-                    img = to_thermal_mono_dither(img, target_width=self.paper_width_px)
+                    if getattr(job, "preset", "") == "foto":
+                        # Cabina: pipeline fotográfico (niveles->exposición->gamma)
+                        img = to_thermal_photo_dither(img, target_width=self.paper_width_px)
+                    else:
+                        img = to_thermal_mono_dither(img, target_width=self.paper_width_px)
                     sender.print_image(img)
                 # Avanzar algunas líneas para evitar que el corte quede muy cerca del contenido
                 try:

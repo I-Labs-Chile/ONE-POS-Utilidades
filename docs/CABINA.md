@@ -59,6 +59,8 @@ Copia `.env.example` a `.env` junto al ejecutable:
 | `PAPER_WIDTH_PX` | `384` | Ancho papel: `384` = 58 mm, `576` = 80 mm |
 | `CABINA_QR_URL` | `https://www.instagram.com/ilabs.cl/` | Destino del QR impreso |
 | `PRINTER_IF` | `usb` | Interfaz: `usb` \| `tcp` |
+| `THERMAL_GAMMA` | `1.4` | Gamma del pipeline foto: >1 aclara sombras (sube a 1.6 si ves barba/pelo tapado; baja a 1.2 si el resultado sale lavado) |
+| `THERMAL_BRIGHTNESS_TARGET` | `128` | Media de brillo objetivo antes de la gamma |
 
 ## Convivencia con el servidor web
 

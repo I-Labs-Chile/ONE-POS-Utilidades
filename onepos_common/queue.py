@@ -31,6 +31,8 @@ class PrintJob:
     error_message: str = ""
     # Tipo de contenido asociado al trabajo: "pdf" o "image"
     kind: str = "pdf"
+    # Pipeline de conversión térmica: "" = legacy (documentos), "foto" = cabina
+    preset: str = ""
 
 class PrintQueue:
     def __init__(self):
@@ -113,14 +115,20 @@ class PrintQueue:
             return len(self._errored_cache)
 
     def _load(self):
-        # Cargar estado si existe
+        # Cargar estado si existe. Se ignoran claves desconocidas para que
+        # una cola escrita por otra versión del binario no rompa el arranque.
+        from dataclasses import fields as _dc_fields
+        campos_validos = {f.name for f in _dc_fields(PrintJob)}
         try:
             if os.path.exists(QUEUE_FILE):
                 with open(QUEUE_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                self._queue = [PrintJob(**j) for j in data.get("pendientes", [])]
-                self._printed_cache = [PrintJob(**j) for j in data.get("impresos", [])]
-                self._errored_cache = [PrintJob(**j) for j in data.get("errores", [])]
+                def _jobs(lista):
+                    return [PrintJob(**{k: v for k, v in j.items() if k in campos_validos})
+                            for j in lista]
+                self._queue = _jobs(data.get("pendientes", []))
+                self._printed_cache = _jobs(data.get("impresos", []))
+                self._errored_cache = _jobs(data.get("errores", []))
         except Exception as e:
             # Log básico en consola
             print(f"# Error cargando cola: {e}")

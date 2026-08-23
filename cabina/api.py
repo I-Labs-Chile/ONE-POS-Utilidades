@@ -139,6 +139,7 @@ async def captura(
         pdf_path=strip_path,
         error_message="",
         kind="image",
+        preset="foto",   # pipeline fotográfico (niveles->exposición->gamma)
     )
     queue.enqueue(job)
     print(f"# Tira de cabina encolada: {job_id} ({len(fotos)} fotos)")
