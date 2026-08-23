@@ -119,7 +119,7 @@ if /i "%TGT%"=="servidor" (
         echo ==========================================
         echo 1^) Ejecutar escpos-cabina.exe ^(instala el driver de la impresora antes^).
         echo 2^) Abrir http://localhost:8081 en Chrome/Edge y permitir la camara.
-        echo 3^) Espacio/F foto | Enter/A imprimir | Esc/R repetir.
+        echo 3^) Teclas: Espacio/F foto, Enter/A imprimir, Esc/R repetir.
         echo.
         echo Requiere impresora instalada en Windows. La autodeteccion busca
         echo impresoras tipo POS-58/POS-80/Thermal y usa la primera disponible.
