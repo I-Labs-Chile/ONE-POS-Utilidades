@@ -13,13 +13,15 @@ class USBPrinterInfo:
 
     # Inicializa la estructura con datos básicos de la impresora.
     def __init__(self, device_path: str, vendor_id: str = None, product_id: str = None,
-                 manufacturer: str = None, product: str = None, serial: str = None):
+                 manufacturer: str = None, product: str = None, serial: str = None,
+                 writable: bool = True):
         self.device_path = device_path
         self.vendor_id = vendor_id
         self.product_id = product_id
         self.manufacturer = manufacturer
         self.product = product
         self.serial = serial
+        self.writable = writable
 
     # Representación breve para logging/debug.
     def __repr__(self):
@@ -86,8 +88,9 @@ class USBPrinterDetector:
         all_devices = set()
 
         for printer in device_printers:
-            all_devices.add(printer.device_path)
-            self.detected_printers.append(printer)
+            if printer.device_path not in all_devices:
+                all_devices.add(printer.device_path)
+                self.detected_printers.append(printer)
 
         self._enrich_with_usb_info(usb_info)
 
@@ -110,12 +113,14 @@ class USBPrinterDetector:
             devices = glob.glob(pattern)
             for device in devices:
                 if os.path.exists(device):
-                    # Añadir solo si es escribible
-                    if os.access(device, os.W_OK):
+                    # Reportar aunque no sea escribible: existe impresora y el
+                    # problema es de permisos (grupo lp), no de conexión
+                    writable = os.access(device, os.W_OK)
+                    if writable:
                         logger.debug(f"Dispositivo escribible encontrado: {device}")
-                        printers.append(USBPrinterInfo(device_path=device))
                     else:
                         logger.warning(f"Dispositivo {device} encontrado sin permiso de escritura")
+                    printers.append(USBPrinterInfo(device_path=device, writable=writable))
 
         return printers
     

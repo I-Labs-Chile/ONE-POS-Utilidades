@@ -81,12 +81,27 @@ class PrinterMonitor:
         detector = USBPrinterDetector()
         printers = detector.scan_for_printers()
 
+        # Preferir nodos escribibles; si hay nodo pero sin permiso, reportar
+        # la solución en lugar de decir que no hay impresora
+        escribibles = [p for p in printers if p.writable]
+
         with self._lock:
-            if printers:
+            if escribibles:
                 self._status["available"] = True
-                self._status["device_path"] = printers[0].device_path
-                self._status["printer_name"] = printers[0].friendly_name
+                self._status["device_path"] = escribibles[0].device_path
+                self._status["printer_name"] = escribibles[0].friendly_name
                 self._status["error"] = None
+            elif printers:
+                nodo = printers[0].device_path
+                error_msg = (
+                    f"Impresora detectada en {nodo} pero sin permisos de escritura. "
+                    "Ejecuta: sudo usermod -a -G lp $USER y vuelve a iniciar sesion"
+                )
+                print(f"# {error_msg}")
+                self._status["available"] = False
+                self._status["device_path"] = nodo
+                self._status["printer_name"] = printers[0].friendly_name
+                self._status["error"] = error_msg
             else:
                 self._status["available"] = False
                 self._status["device_path"] = None
