@@ -52,8 +52,6 @@ jobs:
   windows:
     name: Build Windows (servidor + cabina)
     runs-on: windows-latest
-    env:
-      POPPLER_DIR: ${{ github.workspace }}\poppler\poppler-24.08.0\Library\bin
     steps:
       - uses: actions/checkout@v4
 
@@ -73,9 +71,11 @@ jobs:
       - name: Descargar Poppler (para imprimir PDF)
         shell: pwsh
         run: |
-          Invoke-WebRequest -Uri 'https://github.com/oschwartz10612/poppler-windows/releases/download/v24.08.0-0/Release-24.08.0.zip' -OutFile poppler.zip
+          Invoke-WebRequest -Uri 'https://github.com/oschwartz10612/poppler-windows/releases/download/v24.08.0-0/Release-24.08.0-0.zip' -OutFile poppler.zip
           Expand-Archive -Path poppler.zip -DestinationPath poppler
-          Test-Path "$env:POPPLER_DIR\pdftoppm.exe" || (Throw "pdftoppm.exe no encontrado")
+          $exe = Get-ChildItem -Path poppler -Recurse -Filter pdftoppm.exe | Select-Object -First 1
+          if (-not $exe) { Throw "pdftoppm.exe no encontrado en el zip de Poppler" }
+          "POPPLER_DIR=$($exe.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Crear venv e instalar dependencias
         shell: pwsh
