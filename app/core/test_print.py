@@ -6,9 +6,9 @@ import os
 import time
 from typing import Dict
 
-from app.core.worker import PrintWorker
-from app.printer.manager import create_sender
-from app.utils.network import get_primary_ip
+from onepos_common.worker import PrintWorker
+from onepos_common.printer_manager import create_sender
+from onepos_common.network import get_primary_ip
 
 
 def _build_selftest_url() -> str:

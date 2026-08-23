@@ -10,13 +10,12 @@ from typing import Optional
 import os
 import uuid
 import time
-import threading
-import platform
 
-from app.core.queue import PrintQueue, PrintJob, JobState
-from app.core.worker import PrintWorker
+from onepos_common.queue import PrintQueue, PrintJob, JobState
+from onepos_common.worker import PrintWorker
+from onepos_common.status import create_printer_status, start_printer_monitor
+from onepos_common.network import get_primary_ip
 from app.core.test_print import run_printer_selftest
-from app.utils.network import get_primary_ip
 from app.web.frontend import render_upload_page
 from pathlib import Path
 
@@ -30,80 +29,14 @@ _frontend_static = _frontend_dir / "src"
 if _frontend_static.exists():
     app.mount("/static", StaticFiles(directory=str(_frontend_static)), name="static")
 
-# Inicializar cola y worker globales
+# Inicializar cola y worker globales (selftest de bienvenida inyectado por la app)
 queue = PrintQueue()
 worker = PrintWorker(queue)
+worker.selftest_fn = lambda: run_printer_selftest(worker)
 
-# Estado global de la impresora
-printer_status = {
-    "available": False,
-    "last_check": 0,
-    "device_path": None,
-    "printer_name": None,
-    "error": None
-}
-printer_status_lock = threading.Lock()
-
-def check_printer_availability():
-    """Monitorea continuamente la disponibilidad de la impresora"""
-    global printer_status
-
-    while True:
-        try:
-            system = platform.system()
-            
-            if system == "Windows":
-                # Windows: verificar impresora usando win32print
-                printer_name = os.environ.get("PRINTER_NAME") or os.environ.get("WINDOWS_PRINTER_NAME") or "POS-58"
-                is_available = False
-                error_msg = None
-                
-                try:
-                    import win32print
-                    # Intentar abrir y cerrar la impresora
-                    h = win32print.OpenPrinter(printer_name)
-                    win32print.ClosePrinter(h)
-                    is_available = True
-                except Exception as e:
-                    error_msg = f"No se puede acceder a '{printer_name}': {str(e)}"
-                    print(f"# {error_msg}")
-                
-                with printer_status_lock:
-                    printer_status["available"] = is_available
-                    printer_status["device_path"] = None
-                    printer_status["printer_name"] = printer_name if is_available else None
-                    printer_status["error"] = error_msg
-                    printer_status["last_check"] = int(time.time())
-                    
-            else:
-                # Linux: usar detector USB existente
-                from app.utils.usb_detector import USBPrinterDetector
-                detector = USBPrinterDetector()
-                printers = detector.scan_for_printers()
-                
-                with printer_status_lock:
-                    if printers:
-                        printer_status["available"] = True
-                        printer_status["device_path"] = printers[0].device_path
-                        printer_status["printer_name"] = printers[0].friendly_name
-                        printer_status["error"] = None
-                    else:
-                        printer_status["available"] = False
-                        printer_status["device_path"] = None
-                        printer_status["printer_name"] = None
-                        printer_status["error"] = "No se detectaron impresoras USB"
-                    printer_status["last_check"] = int(time.time())
-                    
-        except Exception as e:
-            error_msg = f"Error en monitoreo de impresora: {str(e)}"
-            print(f"# {error_msg}")
-            with printer_status_lock:
-                printer_status["available"] = False
-                printer_status["error"] = error_msg
-                printer_status["last_check"] = int(time.time())
-
-        # Esperar 3 segundos antes de la siguiente comprobación
-        time.sleep(3)
+# Estado global de la impresora (mantenido por el monitor común)
+printer_status = create_printer_status()
+_printer_monitor = None
 
 
 class Health(BaseModel):
@@ -139,12 +72,11 @@ async def test_impresora():
 
 @app.on_event("startup")
 async def on_startup():
+    global _printer_monitor
     # Arrancar worker de impresión
     worker.start()
-    # Iniciar hilo de monitoreo de impresora
-    monitor_thread = threading.Thread(target=check_printer_availability, daemon=True)
-    monitor_thread.start()
-    print("# Monitor de impresora iniciado")
+    # Iniciar hilo de monitoreo de impresora (común)
+    _printer_monitor = start_printer_monitor(printer_status)
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -240,11 +172,11 @@ async def salud():
     # Endpoint de salud que incluye verificación de disponibilidad de impresora
     pendientes = queue.count_pending()
     impresos = queue.count_last_printed()
-    
-    with printer_status_lock:
-        impresora_disponible = printer_status["available"]
-        impresora_nombre = printer_status["printer_name"]
-        error = printer_status.get("error")
+
+    snapshot = _printer_monitor.snapshot() if _printer_monitor else dict(printer_status)
+    impresora_disponible = snapshot["available"]
+    impresora_nombre = snapshot["printer_name"]
+    error = snapshot.get("error")
     
     health_data = Health(
         ok=impresora_disponible, 

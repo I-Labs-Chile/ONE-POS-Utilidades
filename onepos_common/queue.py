@@ -40,6 +40,7 @@ class PrintQueue:
         self._lock = threading.Lock()
         self._queue: List[PrintJob] = []
         self._printed_cache: List[PrintJob] = []
+        self._errored_cache: List[PrintJob] = []
         self._load()
 
     def get_jobs_dir(self) -> str:
@@ -59,6 +60,8 @@ class PrintQueue:
             return job
 
     def mark_processing(self, job: PrintJob):
+        # El trabajo ya fue retirado por dequeue(); queda solo en memoria
+        # mientras se imprime. Si el proceso muere aqui, el trabajo se pierde.
         with self._lock:
             job.state = JobState.PROCESSING
             self._save()
@@ -66,6 +69,8 @@ class PrintQueue:
     def mark_printed(self, job: PrintJob):
         with self._lock:
             job.state = JobState.PRINTED
+            if job in self._queue:
+                self._queue.remove(job)
             # Agregar al cache de impresos y recortar
             self._printed_cache.insert(0, job)
             if len(self._printed_cache) > MAX_PRINTED_CACHE:
@@ -76,6 +81,15 @@ class PrintQueue:
         with self._lock:
             job.state = JobState.ERROR
             job.error_message = message
+            if job in self._queue:
+                self._queue.remove(job)
+            if job in self._printed_cache:
+                self._printed_cache.remove(job)
+            # Conservar los ultimos errores para diagnostico (si no, el trabajo
+            # desapareceria de queue.json sin rastro al haber sido retirado).
+            self._errored_cache.insert(0, job)
+            if len(self._errored_cache) > MAX_PRINTED_CACHE:
+                self._errored_cache = self._errored_cache[:MAX_PRINTED_CACHE]
             self._save()
 
     def status(self):
@@ -83,6 +97,7 @@ class PrintQueue:
             return {
                 "pendientes": [asdict(j) for j in self._queue],
                 "impresos": [asdict(j) for j in self._printed_cache],
+                "errores": [asdict(j) for j in self._errored_cache],
             }
 
     def count_pending(self) -> int:
@@ -93,6 +108,10 @@ class PrintQueue:
         with self._lock:
             return len(self._printed_cache)
 
+    def count_errored(self) -> int:
+        with self._lock:
+            return len(self._errored_cache)
+
     def _load(self):
         # Cargar estado si existe
         try:
@@ -101,18 +120,26 @@ class PrintQueue:
                     data = json.load(f)
                 self._queue = [PrintJob(**j) for j in data.get("pendientes", [])]
                 self._printed_cache = [PrintJob(**j) for j in data.get("impresos", [])]
+                self._errored_cache = [PrintJob(**j) for j in data.get("errores", [])]
         except Exception as e:
             # Log básico en consola
             print(f"# Error cargando cola: {e}")
 
     def _save(self):
-        # Guardar estado
+        # Guardar estado de forma atómica: se escribe a un archivo temporal y
+        # luego se reemplaza el destino, evitando corrupción si el proceso
+        # muere a mitad de la escritura.
         try:
             data = {
                 "pendientes": [asdict(j) for j in self._queue],
                 "impresos": [asdict(j) for j in self._printed_cache],
+                "errores": [asdict(j) for j in self._errored_cache],
             }
-            with open(QUEUE_FILE, "w", encoding="utf-8") as f:
+            tmp_file = QUEUE_FILE + ".tmp"
+            with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_file, QUEUE_FILE)
         except Exception as e:
             print(f"# Error guardando cola: {e}")

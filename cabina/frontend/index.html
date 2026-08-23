@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="utf-8">
+    <title>Cabina Fotográfica ONE-POS</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="/static/cabina.css">
+</head>
+
+<body>
+    <div class="kiosco">
+
+        <!-- Cámara -->
+        <div id="camaraWrap" class="camara-wrap">
+            <video id="video" autoplay playsinline muted></video>
+            <canvas id="canvas" hidden></canvas>
+
+            <!-- Overlay de cuenta regresiva -->
+            <div id="countdown" class="countdown" hidden></div>
+            <!-- Flash de captura -->
+            <div id="flash" class="flash" hidden></div>
+        </div>
+
+        <!-- Barra de estado superior -->
+        <header class="statusbar">
+            <div class="pill" id="pillCam"><span class="dot"></span><span id="camText">Buscando cámara…</span></div>
+            <img src="/static/empresa.png" alt="I-Labs" class="logo-mini">
+            <div class="pill" id="pillPrinter"><span class="dot"></span><span id="printerText">Buscando impresora…</span></div>
+        </header>
+
+        <!-- Mensajes de estado / error -->
+        <div id="msg" class="msg" hidden></div>
+
+        <!-- Miniaturas de las tomas -->
+        <div id="thumbs" class="thumbs" hidden></div>
+
+        <!-- Controles -->
+        <footer class="controles">
+            <button id="btnAccion" class="btn primario">📸 FOTO <small>[Espacio]</small></button>
+            <button id="btnImprimir" class="btn ok" hidden>🖨️ IMPRIMIR <small>[Enter]</small></button>
+            <button id="btnRepetir" class="btn warn" hidden>↺ REPETIR <small>[Esc]</small></button>
+        </footer>
+
+    </div>
+
+    <script src="/static/cabina.js"></script>
+</body>
+</html>

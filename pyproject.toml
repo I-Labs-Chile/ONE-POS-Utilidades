@@ -26,10 +26,12 @@ dependencies = [
     "uvicorn[standard]==0.32.0",
     "pydantic==2.6.4",
     "python-multipart==0.0.9",
+    "python-dotenv>=1.0",
     "Pillow==10.3.0",
     "numpy==1.26.4",
     "pyusb==1.2.1",
     "requests==2.32.3",
+    "qrcode==7.4.2",
     "pywin32; sys_platform == 'win32'",
 ]
 

@@ -5,16 +5,22 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
+
+# Configuración local
+.env
 
 # Build y binarios
-build/build/
 build/dist/
 build/output/
-*.spec
+build/build_temp*/
 
 # Datos de ejecución
 /data/
-*.json
+/data-cabina/
+
+# Herramientas locales
+.opencode/
 
 # Logs
 *.log

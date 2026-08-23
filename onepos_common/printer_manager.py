@@ -19,10 +19,13 @@ def create_sender(interface: str, host: str, port: int, usb_vendor: int, usb_pro
         use_windows = platform.system() == "Windows"
     
     if use_windows:
-        from app.printer.windows_spooler import WindowsEscposSender
-        printer_name = os.environ.get("PRINTER_NAME") or os.environ.get("WINDOWS_PRINTER_NAME") or "POS-58"
+        from onepos_common.windows_spooler import WindowsEscposSender, resolve_printer_name
+        printer_name = resolve_printer_name()
+        if not printer_name:
+            raise RuntimeError("No se encontró ninguna impresora instalada en Windows (configura PRINTER_NAME en .env)")
+        print(f"# Backend Windows: usando impresora '{printer_name}'")
         return WindowsEscposSender(printer_name)
     else:
         # Linux y otros: mantener backend actual sin cambios
-        from app.utils.escpos import EscposSender
+        from onepos_common.escpos import EscposSender
         return EscposSender(interface=interface, host=host, port=port, usb_vendor=usb_vendor, usb_product=usb_product)

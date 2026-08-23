@@ -7,9 +7,75 @@
 # - El spooler consume los jobs incluso si el driver filtra/ignora comandos ESC/POS; por eso el corte debe considerarse opcional.
 # - Este enfoque se validó imprimiendo texto desde Python usando win32print con StartDocPrinter/WritePrinter/EndDocPrinter.
 
-from typing import Optional
+import os
+import re
+from typing import List, Optional, Tuple
+
 from PIL import Image
 import win32print
+
+# Patrones de nombre usados para auto-seleccionar la impresora térmica
+# cuando no se define PRINTER_NAME en el entorno.
+_PRINTER_PATTERNS = [
+    r"^pos[-_ ]?58",
+    r"^pos[-_ ]?80",
+    r"\bpos\b",
+    r"thermal",
+    r"receipt",
+]
+
+def list_installed_printers() -> List[str]:
+    # Devuelve los nombres de impresoras instaladas (locales y de red conectadas).
+    flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+    try:
+        entries = win32print.EnumPrinters(flags, None, 1)
+    except Exception:
+        return []
+    names: List[Tuple[int, str]] = []
+    for entry in entries:
+        try:
+            name = entry[2]
+        except Exception:
+            continue
+        if name:
+            names.append(name)
+    return sorted(set(names))
+
+def resolve_printer_name() -> Optional[str]:
+    # Resuelve el nombre de impresora a usar en Windows.
+    # Orden de prioridad:
+    #   1. PRINTER_NAME / WINDOWS_PRINTER_NAME del entorno (exacto o por prefijo,
+    #      tolerando sufijos de copia tipo "POS-58 (Copia 1)").
+    #   2. Primera impresora cuyo nombre calce con patrones térmicos conocidos.
+    #   3. Primera impresora instalada.
+    # Esto evita el hardcodeo de "POS-58": si el driver se reinstala, Windows
+    # crea nombres versionados ("POS-58 (Copia 1)") y la referencia fija falla.
+    explicit = os.environ.get("PRINTER_NAME") or os.environ.get("WINDOWS_PRINTER_NAME")
+    installed = list_installed_printers()
+
+    if explicit:
+        lowered = explicit.strip().lower()
+        for name in installed:
+            if name.lower() == lowered:
+                return name
+        for name in installed:
+            if name.lower().startswith(lowered):
+                return name
+        print(f"# Advertencia: '{explicit}' no está entre las impresoras instaladas: {installed or 'ninguna'}")
+        return explicit
+
+    for pattern in _PRINTER_PATTERNS:
+        regex = re.compile(pattern, re.IGNORECASE)
+        for name in installed:
+            if regex.search(name):
+                return name
+
+    if installed:
+        return installed[0]
+
+    print("# No hay impresoras instaladas en Windows")
+    return None
+
 
 class WindowsSpooler:
     def __init__(self, printer_name: str):

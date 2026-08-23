@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Cabina Fotográfica ONE-POS
+Comment=Kiosco de fotos para impresora térmica: 3 fotos + logo + QR
+Exec=bash -c "cd '%k' && ./launch-cabina.sh"
+Icon=camera-photo
+Terminal=false
+Categories=Graphics;Photography;
+Keywords=cabina;fotos;photobooth;thermal;printer;

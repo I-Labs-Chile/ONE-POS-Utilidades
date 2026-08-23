@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Servidor de Impresión ESC/POS
+Comment=Servidor de impresión para impresora térmica Q-Cube con logs visibles
+Exec=bash -c "cd '%k' && ./launch-server.sh"
+Icon=printer
+Terminal=false
+Categories=Utility;Office;
+Keywords=printer;escpos;thermal;server;

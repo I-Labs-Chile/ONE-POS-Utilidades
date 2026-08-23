@@ -3,7 +3,7 @@ import logging
 import time
 import os
 
-from app.utils.usb_detector import USBPrinterDetector, USBPrinterInfo
+from onepos_common.usb_detector import USBPrinterDetector, USBPrinterInfo
 
 logger = logging.getLogger(__name__)
 

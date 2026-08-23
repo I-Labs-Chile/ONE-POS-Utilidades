@@ -4,7 +4,7 @@
 import socket
 from typing import Optional
 from PIL import Image
-from app.utils.usb_printer import USBPrinterBackend
+from onepos_common.usb_printer import USBPrinterBackend
 
 # Intentar importar PyUSB
 try:

@@ -1,0 +1,115 @@
+# Releases de ONE-POS Utilidades.
+# Se dispara al crear un tag v* (ej: v1.1.0). El tag DEBE coincidir con la
+# versión de pyproject.toml. Genera 4 paquetes:
+#   escpos-server-linux-x64-vX.Y.Z.tar.gz
+#   escpos-server-windows-x64-vX.Y.Z.zip   (incluye Poppler para PDF)
+#   escpos-cabina-linux-x64-vX.Y.Z.tar.gz
+#   escpos-cabina-windows-x64-vX.Y.Z.zip
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Build Linux (servidor + cabina)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verificar tag == versión de pyproject.toml
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
+          if [ "v${VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::El tag ${GITHUB_REF_NAME} no coincide con v${VERSION} de pyproject.toml"
+            exit 1
+          fi
+
+      - name: Crear venv e instalar dependencias
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements.txt pyinstaller
+
+      - name: Compilar servidor y cabina
+        run: ./build/build_linux.sh ambos
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-linux
+          path: build/output/*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Build Windows (servidor + cabina)
+    runs-on: windows-latest
+    env:
+      POPPLER_DIR: ${{ github.workspace }}\poppler\poppler-24.08.0\Library\bin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verificar tag == versión de pyproject.toml
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
+          if [ "v${VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::El tag ${GITHUB_REF_NAME} no coincide con v${VERSION} de pyproject.toml"
+            exit 1
+          fi
+
+      - name: Descargar Poppler (para imprimir PDF)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri 'https://github.com/oschwartz10612/poppler-windows/releases/download/v24.08.0-0/Release-24.08.0.zip' -OutFile poppler.zip
+          Expand-Archive -Path poppler.zip -DestinationPath poppler
+          Test-Path "$env:POPPLER_DIR\pdftoppm.exe" || (Throw "pdftoppm.exe no encontrado")
+
+      - name: Crear venv e instalar dependencias
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .venv\Scripts\pip.exe install --upgrade pip
+          .venv\Scripts\pip.exe install -r requirements.txt pyinstaller
+
+      - name: Compilar servidor y cabina
+        shell: cmd
+        run: build\build_windows.bat ambos
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-windows
+          path: build/output/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Publicar release con los 4 paquetes
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Crear release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ls -R dist
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/packages-linux/*.tar.gz \
+            dist/packages-windows/*.zip \
+            --title "ONE-POS Utilidades ${GITHUB_REF_NAME}" \
+            --generate-notes

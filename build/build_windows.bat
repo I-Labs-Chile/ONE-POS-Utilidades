@@ -1,273 +1,145 @@
 @echo off
-REM Script de empaquetado para Windows
-REM Genera un ejecutable standalone con PyInstaller
+REM Build de release para Windows x64.
+REM Uso: build\build_windows.bat [servidor^|cabina^|ambos]   (default: ambos)
+REM Opcional: set POPPLER_DIR=c:\ruta\con\pdftoppm.exe para incluir Poppler
+REM           en el release del servidor (necesario para imprimir PDF).
 
 setlocal enabledelayedexpansion
 
-echo ==========================================
-echo ONE-POS Utilidades - Build para Windows
-echo ==========================================
-echo.
-
-REM Directorio base del proyecto
 set "PROJECT_DIR=%~dp0.."
 set "BUILD_DIR=%~dp0"
 set "DIST_DIR=%BUILD_DIR%dist"
 set "OUTPUT_DIR=%BUILD_DIR%output"
 
-echo Directorio del proyecto: %PROJECT_DIR%
-echo.
+set "TARGET=%~1"
+if "%TARGET%"=="" set "TARGET=ambos"
+if /i not "%TARGET%"=="servidor" if /i not "%TARGET%"=="cabina" if /i not "%TARGET%"=="ambos" (
+    echo Error: target invalido "%TARGET%" ^(usa: servidor, cabina o ambos^)
+    exit /b 1
+)
 
-REM Verificar que estamos en el directorio correcto
 if not exist "%PROJECT_DIR%\run.py" (
-    echo Error: No se encuentra run.py
-    echo Ejecuta este script desde la carpeta build\
+    echo Error: no se encuentra run.py
     exit /b 1
 )
-
-REM Limpiar builds anteriores
-echo Limpiando builds anteriores...
-if exist "%DIST_DIR%" rmdir /s /q "%DIST_DIR%"
-if exist "%BUILD_DIR%\build_temp" rmdir /s /q "%BUILD_DIR%\build_temp"
-if exist "%BUILD_DIR%\*.spec" del /q "%BUILD_DIR%\*.spec"
-if exist "%OUTPUT_DIR%" rmdir /s /q "%OUTPUT_DIR%"
-mkdir "%OUTPUT_DIR%"
-
-REM Verificar Python y entorno virtual
+if /i not "%TARGET%"=="servidor" if not exist "%PROJECT_DIR%\run_cabina.py" (
+    echo Error: no se encuentra run_cabina.py
+    exit /b 1
+)
 if not exist "%PROJECT_DIR%\.venv\Scripts\python.exe" (
-    echo Error: No se encuentra el entorno virtual en .venv
-    echo Crea el entorno virtual primero: python -m venv .venv
+    echo Error: no existe .venv ^(crea el entorno e instala requirements.txt^)
     exit /b 1
 )
 
-REM Verificar/instalar PyInstaller
-echo Verificando PyInstaller...
-"%PROJECT_DIR%\.venv\Scripts\python.exe" -c "import PyInstaller" 2>nul
-if errorlevel 1 (
-    echo Instalando PyInstaller...
+REM Version unica fuente de verdad: pyproject.toml
+set "VERSION="
+for /f "usebackq tokens=2 delims== " %%v in (`findstr /b "version" "%PROJECT_DIR%\pyproject.toml"`) do set "VERSION=%%~v"
+if not defined VERSION set "VERSION=0.0.0"
+
+echo ==^> ONE-POS Utilidades %VERSION% ^(Windows^) - target: %TARGET%
+
+"%PROJECT_DIR%\.venv\Scripts\python.exe" -c "import PyInstaller" 2>nul || (
+    echo ==^> Instalando PyInstaller...
     "%PROJECT_DIR%\.venv\Scripts\pip.exe" install pyinstaller
 )
 
-REM Ensure pywin32 is present for win32print
-"%PROJECT_DIR%\.venv\Scripts\pip.exe" install pywin32
+if exist "%OUTPUT_DIR%" rmdir /s /q "%OUTPUT_DIR%"
+mkdir "%OUTPUT_DIR%"
 
-REM Versión
-set "VERSION=1.0.0"
-set "APP_NAME=escpos-server-windows-x64-v%VERSION%"
+if /i "%TARGET%"=="servidor" goto build_servidor
+if /i "%TARGET%"=="cabina" goto build_cabina
 
-echo Version: %VERSION%
-echo Nombre del paquete: %APP_NAME%
-echo.
+:build_servidor
+call :build_target servidor || goto :fail
+if /i "%TARGET%"=="ambos" goto build_cabina
+goto :ok
 
-REM Crear spec file personalizado
-echo Generando configuracion de PyInstaller...
-(
-echo # -*- mode: python ; coding: utf-8 -*-
-echo.
-echo block_cipher = None
-echo.
-echo a = Analysis^(
-echo     ['..\\run.py'],
-echo     pathex=[],
-echo     binaries=[],
-echo     datas=[
-echo         ^('..\\app', 'app'^),
-echo     ],
-echo     hiddenimports=[
-echo         'app',
-echo         'app.web',
-echo         'app.web.api',
-echo         'app.web.frontend',
-echo         'app.core',
-echo         'app.core.worker',
-echo         'app.core.queue',
-echo         'app.core.test_print',
-echo         'app.utils',
-echo         'app.utils.escpos',
-echo         'app.utils.image',
-echo         'app.utils.network',
-echo         'app.printer.manager',
-echo         'app.printer.windows_spooler',
-echo         'uvicorn.logging',
-echo         'uvicorn.loops',
-echo         'uvicorn.loops.auto',
-echo         'uvicorn.protocols',
-echo         'uvicorn.protocols.http',
-echo         'uvicorn.protocols.http.auto',
-echo         'uvicorn.protocols.websockets',
-echo         'uvicorn.protocols.websockets.auto',
-echo         'uvicorn.lifespan',
-echo         'uvicorn.lifespan.on',
-echo         'win32print',
-echo     ],
-echo     hookspath=[],
-echo     hooksconfig={},
-echo     runtime_hooks=[],
-echo     excludes=[
-echo         'usb',
-echo         'usb.backend',
-echo         'usb.backend.libusb1',
-echo         'app.utils.usb_printer',
-echo         'app.utils.usb_detector',
-echo     ],
-echo     win_no_prefer_redirects=False,
-echo     win_private_assemblies=False,
-echo     cipher=block_cipher,
-echo     noarchive=False,
-echo ^)
-echo.
-echo pyz = PYZ^(a.pure, a.zipped_data, cipher=block_cipher^)
-echo.
-echo exe = EXE^(
-echo     pyz,
-echo     a.scripts,
-echo     a.binaries,
-echo     a.zipfiles,
-echo     a.datas,
-echo     [],
-echo     name='escpos-server',
-echo     debug=False,
-echo     bootloader_ignore_signals=False,
-echo     strip=False,
-echo     upx=True,
-echo     upx_exclude=[],
-echo     runtime_tmpdir=None,
-echo     console=True,
-echo     disable_windowed_traceback=False,
-echo     argv_emulation=False,
-echo     target_arch=None,
-echo     codesign_identity=None,
-echo     entitlements_file=None,
-echo     icon=None,
-echo ^)
-) > "%BUILD_DIR%\escpos-windows.spec"
+:build_cabina
+call :build_target cabina || goto :fail
+goto :ok
 
-REM Compilar con PyInstaller
-echo Compilando aplicacion...
-cd /d "%BUILD_DIR%"
-"%PROJECT_DIR%\.venv\Scripts\pyinstaller.exe" --clean escpos-windows.spec
-
-REM Verificar que se creó el ejecutable
-if not exist "%DIST_DIR%\escpos-server.exe" (
-    echo Error: No se genero el ejecutable
-    exit /b 1
+:build_target
+setlocal enabledelayedexpansion
+set "TGT=%~1"
+if /i "%TGT%"=="servidor" (
+    set "SPEC=escpos-windows.spec"
+    set "EXE_NAME=escpos-server"
+    set "APP_NAME=escpos-server-windows-x64-v%VERSION%"
+) else (
+    set "SPEC=escpos-cabina-windows.spec"
+    set "EXE_NAME=escpos-cabina"
+    set "APP_NAME=escpos-cabina-windows-x64-v%VERSION%"
 )
 
-echo [OK] Ejecutable generado correctamente
-echo.
+echo ==^> Compilando !TGT! ^(!SPEC!^)...
+cd /d "%BUILD_DIR%"
+"%PROJECT_DIR%\.venv\Scripts\pyinstaller.exe" --clean --noconfirm "!SPEC!"
+if errorlevel 1 (endlocal & exit /b 1)
 
-REM Crear estructura del release
-echo Creando paquete de distribucion...
-set "RELEASE_DIR=%OUTPUT_DIR%\%APP_NAME%"
-mkdir "%RELEASE_DIR%"
+if not exist "%DIST_DIR%\!EXE_NAME!.exe" (
+    echo Error: no se genero el ejecutable !EXE_NAME!.exe
+    endlocal & exit /b 1
+)
 
-REM Copiar ejecutable
-copy "%DIST_DIR%\escpos-server.exe" "%RELEASE_DIR%\"
-
-REM Crear directorio de datos
+echo ==^> Armando paquete de !TGT!...
+set "RELEASE_DIR=%OUTPUT_DIR%\!APP_NAME!"
 mkdir "%RELEASE_DIR%\data"
+copy "%DIST_DIR%\!EXE_NAME!.exe" "%RELEASE_DIR%\" >nul
+copy "%PROJECT_DIR%\LICENSE" "%RELEASE_DIR%\" >nul
 
-REM Crear archivo de configuración de ejemplo
-(
-echo # Configuracion de la impresora
-echo PRINTER_IF=usb
-echo # PRINTER_IF=tcp
-echo.
-echo # Para impresoras TCP
-echo # PRINTER_HOST=192.168.1.100
-echo # PRINTER_PORT=9100
-echo.
-echo # Para impresoras USB especificas ^(autodeteccion si se omite^)
-echo # USB_VENDOR=0x04b8
-echo # USB_PRODUCT=0x0202
-echo.
-echo # Configuracion del papel
-echo PAPER_WIDTH_PX=384
-echo # PAPER_WIDTH_PX=576  # Para papel de 80mm
-echo.
-echo # Puerto del servidor
-echo SERVER_PORT=8080
-echo.
-echo # Directorio de datos
-echo QUEUE_DIR=./data
-) > "%RELEASE_DIR%\.env.example"
+set "POPPLER_NOTE="
+if /i "%TGT%"=="servidor" (
+    copy "%BUILD_DIR%launch-server-windows.ps1" "%RELEASE_DIR%\" >nul
+    copy "%PROJECT_DIR%\.env.example" "%RELEASE_DIR%\" >nul
+    (
+        echo SERVIDOR DE IMPRESION ESC/POS - INICIO RAPIDO
+        echo =============================================
+        echo 1^) Ejecutar escpos-server.exe ^(si Windows lo bloquea: click derecho,
+        echo    Propiedades y marcar "Desbloquear"^).
+        echo 2^) Abrir http://localhost:8080 y arrastrar PDF o imagenes.
+        echo.
+        echo Configuracion opcional: copiar .env.example a .env y editar.
+        echo Guia completa: https://github.com/I-Labs-Chile/ONE-POS-Utilidades/tree/main/docs
+    ) > "%RELEASE_DIR%\LEEME.txt"
+    REM Poppler opcional para imprimir PDF
+    if defined POPPLER_DIR if exist "%POPPLER_DIR%\pdftoppm.exe" (
+        copy "%POPPLER_DIR%\pdftoppm.exe" "%RELEASE_DIR%\" >nul
+        copy "%POPPLER_DIR%\*.dll" "%RELEASE_DIR%\" >nul 2>&1
+        echo Incluye Poppler: se pueden imprimir PDF.>> "%RELEASE_DIR%\LEEME.txt"
+        set "POPPLER_NOTE=si"
+    )
+    if not defined POPPLER_NOTE (
+        echo NOTA: sin Poppler ^(pdftoppm.exe^) solo se imprimen imagenes, no PDF.>> "%RELEASE_DIR%\LEEME.txt"
+    )
+) else (
+    copy "%BUILD_DIR%launch-cabina-windows.ps1" "%RELEASE_DIR%\" >nul
+    copy "%PROJECT_DIR%\cabina\.env.example" "%RELEASE_DIR%\" >nul
+    (
+        echo CABINA FOTOGRAFICA ONE-POS - INICIO RAPIDO
+        echo ==========================================
+        echo 1^) Ejecutar escpos-cabina.exe ^(instala el driver de la impresora antes^).
+        echo 2^) Abrir http://localhost:8081 en Chrome/Edge y permitir la camara.
+        echo 3^) Espacio/F foto | Enter/A imprimir | Esc/R repetir.
+        echo.
+        echo Requiere impresora instalada en Windows. La autodeteccion busca
+        echo impresoras tipo POS-58/POS-80/Thermal y usa la primera disponible.
+        echo Configuracion opcional: copiar .env.example a .env y editar.
+        echo Guia completa: https://github.com/I-Labs-Chile/ONE-POS-Utilidades/tree/main/docs
+    ) > "%RELEASE_DIR%\LEEME.txt"
+)
 
-REM Crear README de distribución
-(
-echo ONE-POS Utilidades - Servidor de Impresion ESC/POS para Windows
-echo ================================================================
-echo.
-echo INSTALACION
-echo -----------
-echo.
-echo 1. Descomprimir el archivo ZIP en una carpeta de tu eleccion
-echo.
-echo 2. Configurar la aplicacion:
-echo    - Copiar .env.example a .env
-echo    - Editar .env con tu configuracion
-echo.
-echo EJECUCION
-echo ---------
-echo.
-echo Ejecutar directamente:
-echo.
-echo     escpos-server.exe
-echo.
-echo ACCESO
-echo ------
-echo.
-echo Una vez iniciado, abre tu navegador en:
-echo.
-echo     http://localhost:8080
-echo.
-echo O usa la IP local del servidor desde otro dispositivo.
-echo.
-echo SERVICIO DE WINDOWS ^(OPCIONAL^)
-echo ------------------------------
-echo.
-echo Para ejecutar como servicio de Windows, puedes usar NSSM:
-echo.
-echo 1. Descargar NSSM: https://nssm.cc/download
-echo.
-echo 2. Instalar el servicio:
-echo    nssm install EscposServer "C:\ruta\completa\escpos-server.exe"
-echo.
-echo 3. Configurar y arrancar:
-echo    nssm start EscposServer
-echo.
-echo NOTAS IMPORTANTES
-echo ----------------
-echo.
-echo - Windows Defender puede bloquear el ejecutable la primera vez
-echo - Agrega una excepcion en Windows Defender si es necesario
-echo - Para impresoras USB, asegurate de tener los drivers instalados
-echo.
-echo SOPORTE
-echo -------
-echo.
-echo GitHub: https://github.com/I-Labs-Chile/ONE-POS-Utilidades
-) > "%RELEASE_DIR%\README.txt"
-
-REM Copiar licencia
-if exist "%PROJECT_DIR%\LICENSE" copy "%PROJECT_DIR%\LICENSE" "%RELEASE_DIR%\"
-
-REM Crear ZIP
-echo Comprimiendo paquete...
 cd /d "%OUTPUT_DIR%"
-powershell -command "Compress-Archive -Path '%APP_NAME%' -DestinationPath '%APP_NAME%.zip' -Force"
+powershell -NoProfile -Command "Compress-Archive -Path '!APP_NAME!' -DestinationPath '!APP_NAME!.zip' -Force"
+endlocal
+exit /b 0
 
-REM Información final
-echo.
-echo ==========================================
-echo Build completado exitosamente
-echo ==========================================
-echo.
-echo Ejecutable: %RELEASE_DIR%\escpos-server.exe
-echo Paquete: %OUTPUT_DIR%\%APP_NAME%.zip
-echo.
-echo Para probar:
-echo   cd %RELEASE_DIR%
-echo   escpos-server.exe
-echo.
+:ok
+echo ==^> Listo:
+dir /b "%OUTPUT_DIR%\*.zip"
+if not defined CI pause
+exit /b 0
 
-pause
+:fail
+echo ==^> Build FALLIDO
+if not defined CI pause
+exit /b 1

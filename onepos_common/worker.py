@@ -3,18 +3,24 @@
 # Rasteriza PDF, convierte a monocromo y envía ESC/POS
 
 import os
+import glob
+import re
 import threading
 import subprocess
 from typing import Optional
 from PIL import Image
 
-from app.core.queue import PrintQueue, PrintJob, JobState
-from app.printer.manager import create_sender
+from onepos_common.queue import PrintQueue, PrintJob, JobState
+from onepos_common.printer_manager import create_sender
 
-from app.utils.image import to_thermal_mono_dither
+from onepos_common.image import to_thermal_mono_dither
 
 class PrintWorker:
-    def __init__(self, queue: PrintQueue):
+    def __init__(self, queue: PrintQueue, selftest_fn=None):
+        self.queue = queue
+        # Callback opcional de prueba de impresión al arrancar (inyectado por
+        # cada utilidad; evita que common dependa de código de las apps).
+        self.selftest_fn = selftest_fn
         self.queue = queue
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -47,9 +53,11 @@ class PrintWorker:
 
     def _print_welcome(self):
         # Imprime mensaje de bienvenida y QR al iniciar el servidor
-        from app.core.test_print import run_printer_selftest
+        if self.selftest_fn is None:
+            print("# Sin prueba de impresion configurada al arrancar")
+            return
         try:
-            threading.Thread(target=lambda: run_printer_selftest(self), daemon=True).start()
+            threading.Thread(target=self.selftest_fn, daemon=True).start()
         except Exception as e:
             print(f"# No se pudo ejecutar impresión de bienvenida: {e}")
 
@@ -132,17 +140,24 @@ class PrintWorker:
             out_prefix,
         ]
         print(f"# Ejecutando rasterización: {' '.join(cmd)}")
-        subprocess.run(cmd, check=True)
-        # Recoger archivos generados
+        try:
+            subprocess.run(cmd, check=True)
+        except FileNotFoundError:
+            raise RuntimeError(
+                "No se encontró 'pdftoppm' (poppler-utils). En Linux instale: "
+                "sudo apt-get install poppler-utils. La versión para Windows debe "
+                "incluir poppler junto al ejecutable."
+            )
+        # Recoger archivos generados con orden natural de páginas.
+        # pdftoppm rellena con ceros el número cuando hay 10+ páginas
+        # (ej: prefix-01.png), por eso se usa glob y no una secuencia fija.
         base = os.path.basename(pdf_path) + "_page"
         dirp = self.queue.get_jobs_dir()
-        files = []
-        for i in range(1, 1000):
-            candidate = os.path.join(dirp, f"{base}-{i}.png")
-            if os.path.exists(candidate):
-                files.append(candidate)
-            else:
-                if i == 1:
-                    raise RuntimeError("No se generaron imágenes del PDF")
-                break
+        pattern = os.path.join(dirp, f"{base}-*.png")
+        def _page_number(path: str) -> int:
+            match = re.search(r"-(\d+)\.png$", path)
+            return int(match.group(1)) if match else 0
+        files = sorted(glob.glob(pattern), key=_page_number)
+        if not files:
+            raise RuntimeError("No se generaron imágenes del PDF")
         return files
