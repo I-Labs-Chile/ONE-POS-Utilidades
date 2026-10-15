@@ -13,6 +13,7 @@ __pycache__/
 # Build y binarios
 build/dist/
 build/output/
+build/build/
 build/build_temp*/
 
 # Datos de ejecución

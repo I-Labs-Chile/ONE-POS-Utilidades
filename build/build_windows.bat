@@ -43,6 +43,14 @@ echo ==^> ONE-POS Utilidades %VERSION% ^(Windows^) - target: %TARGET%
     "%PROJECT_DIR%\.venv\Scripts\pip.exe" install pyinstaller
 )
 
+REM pywin32 provee win32print (impresion por spooler RAW en Windows). Sin el,
+REM los specs compilan igual pero el exe falla al imprimir con:
+REM   No module named 'win32print'
+"%PROJECT_DIR%\.venv\Scripts\python.exe" -c "import win32print" 2>nul || (
+    echo ==^> Instalando pywin32 ^(requerido para win32print^)...
+    "%PROJECT_DIR%\.venv\Scripts\pip.exe" install pywin32
+)
+
 if exist "%OUTPUT_DIR%" rmdir /s /q "%OUTPUT_DIR%"
 mkdir "%OUTPUT_DIR%"
 

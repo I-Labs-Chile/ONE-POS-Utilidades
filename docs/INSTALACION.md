@@ -95,6 +95,7 @@ nano .env    # editar y reiniciar el servidor
 | No accedo desde otro dispositivo | Misma red; abre el puerto en el firewall (`sudo ufw allow 8080`) |
 | Impresión muy oscura/clara | El servidor normaliza automáticamente; verifica calidad del papel térmico y densidad del cabezal |
 | PDF no imprime en Windows | Falta `pdftoppm.exe` (Poppler); colócalo junto al ejecutable |
+| `No module named 'win32print'` (ejecutando desde código, no desde el exe) | Falta `pywin32` en el venv: `.venv\Scripts\pip.exe install -r requirements.txt`. Los ejecutables de release ya lo incluyen. |
 | Impresión cortada o mal ancho | Ajusta `PAPER_WIDTH_PX` (384 para 58mm, 576 para 80mm) |
 
 ## Soporte
